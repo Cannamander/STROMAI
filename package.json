@@ -1,0 +1,17 @@
+{
+  "name": "stromai",
+  "version": "0.1.0",
+  "private": true,
+  "scripts": {
+    "nws:once": "node services/nws-ingestor/index.js once",
+    "nws:poll": "node services/nws-ingestor/index.js poll"
+  },
+  "dependencies": {
+    "dotenv": "^16.3.1",
+    "pg": "^8.11.3",
+    "undici": "^5.28.0"
+  },
+  "engines": {
+    "node": ">=18"
+  }
+}
