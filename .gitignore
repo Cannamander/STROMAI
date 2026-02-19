@@ -1,0 +1,11 @@
+# Env and secrets (never commit)
+.env
+.env.*
+!.env.example
+
+# Dependencies
+node_modules/
+
+# Logs and local
+*.log
+.DS_Store

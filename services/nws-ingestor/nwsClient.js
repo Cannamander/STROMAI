@@ -9,11 +9,19 @@ function sleep(ms) {
 }
 
 /**
- * Fetch active NWS alerts for the configured area with retry on 429/5xx.
+ * Fetch active NWS alerts for the configured state(s) with retry on 429/5xx.
+ * Uses repeated area params: ?status=actual&area=TX&area=OK&area=LA
  * @returns {Promise<{ type: string, features: Array }>} GeoJSON FeatureCollection
  */
 async function fetchActiveAlerts() {
-  const url = `${config.nwsBaseUrl}/alerts/active?status=actual&area=${encodeURIComponent(config.nwsArea)}`;
+  const areas = config.nwsStates && config.nwsStates.length > 0 ? config.nwsStates : [config.nwsArea];
+  const areaParams = areas.map((a) => `area=${encodeURIComponent(a)}`).join('&');
+  const url = `${config.nwsBaseUrl}/alerts/active?status=actual&${areaParams}`;
+
+  if (config.logLevel === 'debug') {
+    console.error('[nwsClient] GET', url);
+  }
+
   const headers = {
     'User-Agent': config.nwsUserAgent,
     Accept: 'application/geo+json',
