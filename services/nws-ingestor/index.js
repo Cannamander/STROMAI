@@ -4,6 +4,7 @@ const { fetchActiveAlerts } = require('./nwsClient');
 const { normalizeFeature } = require('./normalize');
 const { classifyAlert, isActionable } = require('./activation');
 const { upsertAlerts, getZipsByGeometry, upsertAlertImpactedZips, closePool } = require('./db');
+const { enrichWithLsr } = require('./lsrEnrich');
 
 // DB insert is actionable-only: warnings (allowlist) + optionally watches when INCLUDE_WATCH=true.
 // Expires must be in the future. All filtering is via classifyAlert + future-expires.
@@ -28,6 +29,10 @@ async function ingestOnce() {
   let total_zips_mapped = 0;
   let impact_inserted = 0;
   let impact_updated = 0;
+  let lsr_products_fetched = 0;
+  let lsr_entries_parsed = 0;
+  let lsr_entries_with_points = 0;
+  let lsr_matches_inserted = 0;
 
   try {
     const data = await fetchActiveAlerts();
@@ -115,6 +120,16 @@ async function ingestOnce() {
     impact_inserted = impactResult.inserted_count;
     impact_updated = impactResult.updated_count;
 
+    try {
+      const lsrResult = await enrichWithLsr(actionableRows);
+      lsr_products_fetched = lsrResult.lsr_products_fetched;
+      lsr_entries_parsed = lsrResult.lsr_entries_parsed;
+      lsr_entries_with_points = lsrResult.lsr_entries_with_points;
+      lsr_matches_inserted = lsrResult.lsr_matches_inserted;
+    } catch (lsrErr) {
+      console.error('[LSR] enrich failed:', lsrErr.message);
+    }
+
     const duration_ms = Date.now() - start;
 
     // One summary line per actionable alert: [warning] or [watch] then event | area | geom | zips | sent | expires
@@ -153,6 +168,10 @@ async function ingestOnce() {
       nws_alerts_updated: updated_count,
       impact_inserted,
       impact_updated,
+      lsr_products_fetched,
+      lsr_entries_parsed,
+      lsr_entries_with_points,
+      lsr_matches_inserted,
       duration_ms,
     };
     console.log(JSON.stringify(summary));
@@ -166,6 +185,10 @@ async function ingestOnce() {
       total_zips_mapped,
       impact_inserted,
       impact_updated,
+      lsr_products_fetched,
+      lsr_entries_parsed,
+      lsr_entries_with_points,
+      lsr_matches_inserted,
       duration_ms,
     };
   } catch (err) {

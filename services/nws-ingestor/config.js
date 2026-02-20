@@ -1,19 +1,28 @@
 require('dotenv').config();
 
+/** Default NWS event types we treat as actionable (damaging / high-value for home services leads). */
 const DEFAULT_EVENTS = [
   'Tornado Warning',
   'Severe Thunderstorm Warning',
   'Flash Flood Warning',
   'High Wind Warning',
+  'Hurricane Warning',
+  'Tropical Storm Warning',
+  'Storm Surge Warning',
+  'Blizzard Warning',
   'Ice Storm Warning',
   'Winter Storm Warning',
   'Hard Freeze Warning',
   'Freeze Warning',
   'Extreme Cold Warning',
   'Wind Chill Warning',
+  'Excessive Heat Warning',
   'Winter Weather Advisory',
   'Wind Chill Advisory',
   'Frost Advisory',
+  'Coastal Flood Warning',
+  'Lakeshore Flood Warning',
+  'Dense Fog Advisory',
 ];
 
 function parseEvents(envValue) {
@@ -45,4 +54,6 @@ module.exports = {
   includeWatch: process.env.INCLUDE_WATCH === 'true' || process.env.INCLUDE_WATCH === '1',
   logLevel: process.env.LOG_LEVEL || 'info',
   dryRun: process.env.DRY_RUN === 'true' || process.env.DRY_RUN === '1',
+  lsrLookbackHours: Math.max(1, parseInt(process.env.LSR_LOOKBACK_HOURS, 10) || 12),
+  lsrTimeSlopHours: Math.max(0, parseInt(process.env.LSR_TIME_SLOP_HOURS, 10) || 2),
 };

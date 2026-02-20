@@ -1,7 +1,7 @@
 'use strict';
 const { describe, it } = require('node:test');
 const assert = require('node:assert');
-const { getZipsQueryParams, ZIPS_INTERSECT_SQL } = require('./db');
+const { getZipsQueryParams, ZIPS_INTERSECT_SQL, LSR_POINT_IN_GEOM_SQL } = require('./db');
 
 describe('getZipsByGeometry / PostGIS params', () => {
   it('uses parameterized SQL ($1) only, no string concatenation', () => {
@@ -38,5 +38,17 @@ describe('getZipsByGeometry / PostGIS params', () => {
     assert.deepStrictEqual(getZipsQueryParams(null), []);
     assert.deepStrictEqual(getZipsQueryParams(undefined), []);
     assert.deepStrictEqual(getZipsQueryParams(''), []);
+  });
+});
+
+describe('LSR point-in-polygon SQL', () => {
+  it('uses parameterized SQL ($1, $2, $3) only', () => {
+    assert.ok(LSR_POINT_IN_GEOM_SQL.includes('$1'));
+    assert.ok(LSR_POINT_IN_GEOM_SQL.includes('$2'));
+    assert.ok(LSR_POINT_IN_GEOM_SQL.includes('$3'));
+    assert.ok(LSR_POINT_IN_GEOM_SQL.includes('ST_GeomFromGeoJSON($1::text)'));
+    assert.ok(LSR_POINT_IN_GEOM_SQL.includes('ST_MakePoint($2'));
+    const params = LSR_POINT_IN_GEOM_SQL.match(/\$\d+/g) || [];
+    assert.strictEqual(params.length, 3);
   });
 });

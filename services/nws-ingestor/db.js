@@ -1,5 +1,6 @@
 require('dotenv').config();
 const { Pool } = require('pg');
+const crypto = require('crypto');
 
 const pool = new Pool({
   connectionString: process.env.DATABASE_URL,
@@ -157,6 +158,57 @@ async function upsertAlertImpactedZips(rows) {
   return { inserted_count: inserted, updated_count: updated };
 }
 
+// LSR: point-in-polygon (alert geometry in 4326; point lon, lat). Parameterized only.
+const LSR_POINT_IN_GEOM_SQL = `
+  SELECT ST_Contains(
+    ST_SetSRID(ST_GeomFromGeoJSON($1::text), 4326),
+    ST_SetSRID(ST_MakePoint($2::double precision, $3::double precision), 4326)
+  ) AS inside
+`;
+
+/**
+ * Check if point (lon, lat) is inside alert GeoJSON geometry. Uses parameterized SQL.
+ * @param {object} alertGeojsonGeometry - GeoJSON geometry
+ * @param {number} lon
+ * @param {number} lat
+ * @returns {Promise<boolean>}
+ */
+async function lsrPointInAlertGeometry(alertGeojsonGeometry, lon, lat) {
+  if (alertGeojsonGeometry == null || typeof alertGeojsonGeometry !== 'object') return false;
+  const { rows } = await pool.query(LSR_POINT_IN_GEOM_SQL, [JSON.stringify(alertGeojsonGeometry), lon, lat]);
+  return rows[0]?.inside === true;
+}
+
+const LSR_INSERT_SQL = `
+  INSERT INTO public.nws_alert_lsr (alert_id, lsr_product_id, entry_time, point_geom, hail_in, wind_gust_mph, raw_text, raw_text_hash)
+  VALUES ($1, $2, $3, ST_SetSRID(ST_MakePoint($4::double precision, $5::double precision), 4326), $6, $7, $8, $9)
+`;
+
+/**
+ * Insert one LSR match row. Skips if duplicate (same alert_id, lsr_product_id, entry_time, raw_text_hash).
+ * @returns {Promise<'inserted'|'skipped'>}
+ */
+async function insertLsrMatch(row) {
+  const raw_text_hash = crypto.createHash('md5').update(row.raw_text || '').digest('hex');
+  const existing = await pool.query(
+    'SELECT 1 FROM public.nws_alert_lsr WHERE alert_id = $1 AND lsr_product_id = $2 AND (entry_time IS NOT DISTINCT FROM $3) AND raw_text_hash = $4',
+    [row.alert_id, row.lsr_product_id, row.entry_time ?? null, raw_text_hash]
+  );
+  if (existing.rows.length > 0) return 'skipped';
+  await pool.query(LSR_INSERT_SQL, [
+    row.alert_id,
+    row.lsr_product_id,
+    row.entry_time ?? null,
+    row.lon,
+    row.lat,
+    row.hail_in ?? null,
+    row.wind_gust_mph ?? null,
+    row.raw_text ?? null,
+    raw_text_hash,
+  ]);
+  return 'inserted';
+}
+
 async function closePool() {
   await pool.end();
 }
@@ -168,5 +220,8 @@ module.exports = {
   getZipsQueryParams,
   ZIPS_INTERSECT_SQL,
   upsertAlertImpactedZips,
+  lsrPointInAlertGeometry,
+  LSR_POINT_IN_GEOM_SQL,
+  insertLsrMatch,
   closePool,
 };
