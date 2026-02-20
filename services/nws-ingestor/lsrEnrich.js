@@ -1,8 +1,11 @@
 'use strict';
 const config = require('./config');
-const { fetchRecentLsrProducts } = require('./lsrClient');
-const { parseLsrProduct } = require('./lsrParser');
-const { lsrPointInAlertGeometry, insertLsrMatch } = require('./db');
+const { listLsrProductIds, fetchProduct } = require('./lsrClient');
+const { parseLsrProduct, parseLsrProductToObservations } = require('./lsrParser');
+const { lsrPointInAlertGeometry, insertLsrMatch, upsertLsrObservations, runSetBasedLsrMatch, updateAlertLsrSummary } = require('./db');
+const log = require('./logger');
+
+const LSR_FETCH_CONCURRENCY = Math.min(10, Math.max(5, parseInt(process.env.LSR_FETCH_CONCURRENCY, 10) || 8));
 
 /**
  * For one actionable alert, match LSR entries (with lat/lon) to alert geometry and time window; insert matches.
@@ -63,7 +66,7 @@ async function enrichWithLsr(actionableAlerts) {
     products = await fetchRecentLsrProducts();
     lsr_products_fetched = products.length;
   } catch (err) {
-    console.error('[LSR] fetch failed:', err.message);
+    log.errorMsg('LSR fetch failed: ' + (err && err.message));
     return { lsr_products_fetched: 0, lsr_entries_parsed: 0, lsr_entries_with_points: 0, lsr_matches_inserted: 0 };
   }
 
@@ -78,13 +81,18 @@ async function enrichWithLsr(actionableAlerts) {
   const slopHours = config.lsrTimeSlopHours;
   const alertsWithGeom = (actionableAlerts || []).filter((a) => a.geometry_json != null);
 
-  for (const alert of alertsWithGeom) {
-    try {
-      const result = await enrichAlertWithLsr(alert, products, slopHours);
-      lsr_matches_inserted += result.matchesInserted;
-    } catch (err) {
-      console.error('[LSR] enrich failed for alert', alert.id, err.message);
-    }
+  const enrichResults = await Promise.all(
+    alertsWithGeom.map(async (alert) => {
+      try {
+        return await enrichAlertWithLsr(alert, products, slopHours);
+      } catch (err) {
+        log.errorMsg('LSR enrich failed for alert ' + (alert && alert.id) + ': ' + (err && err.message));
+        return { matchesInserted: 0 };
+      }
+    })
+  );
+  for (const result of enrichResults) {
+    lsr_matches_inserted += result.matchesInserted;
   }
 
   return {
@@ -95,4 +103,68 @@ async function enrichWithLsr(actionableAlerts) {
   };
 }
 
-module.exports = { enrichAlertWithLsr, enrichWithLsr };
+/**
+ * LSR pipeline: discover products (lookback), fetch with concurrency limit, parse to observations,
+ * upsert nws_lsr_observations, run set-based match (warnings only), update alert LSR summaries.
+ * @returns {Promise<{ lsr_products_fetched: number, lsr_observations_parsed: number, lsr_observations_upserted: number, lsr_matches_inserted: number }>}
+ */
+async function runLsrPipeline() {
+  let lsr_products_fetched = 0;
+  let lsr_observations_parsed = 0;
+  let lsr_observations_upserted = 0;
+  let lsr_matches_inserted = 0;
+
+  let productIds = [];
+  try {
+    const list = await listLsrProductIds();
+    productIds = list.map((p) => p.id).filter(Boolean);
+  } catch (err) {
+    log.errorMsg('LSR list failed: ' + (err && err.message));
+    return { lsr_products_fetched: 0, lsr_observations_parsed: 0, lsr_observations_upserted: 0, lsr_matches_inserted: 0 };
+  }
+
+  const products = [];
+  for (let i = 0; i < productIds.length; i += LSR_FETCH_CONCURRENCY) {
+    const chunk = productIds.slice(i, i + LSR_FETCH_CONCURRENCY);
+    const results = await Promise.all(
+      chunk.map(async (id) => {
+        try {
+          const p = await fetchProduct(id);
+          if (p && (p.productText || '').trim()) return p;
+        } catch (_) {
+          // skip
+        }
+        return null;
+      })
+    );
+    products.push(...results.filter(Boolean));
+  }
+  lsr_products_fetched = products.length;
+
+  const allObservations = [];
+  for (const prod of products) {
+    const issued = prod.issuanceTime || null;
+    const wfo = null;
+    const rows = parseLsrProductToObservations(prod.productText, prod.productId, issued, wfo);
+    lsr_observations_parsed += rows.length;
+    allObservations.push(...rows);
+  }
+
+  if (allObservations.length > 0) {
+    lsr_observations_upserted = await upsertLsrObservations(allObservations);
+    const bufferHours = config.alertLsrTimeBufferHours ?? 2;
+    const distanceMeters = config.alertLsrDistanceMeters ?? 30000;
+    const matchResult = await runSetBasedLsrMatch(bufferHours, distanceMeters);
+    lsr_matches_inserted = matchResult.inserted ?? 0;
+    await updateAlertLsrSummary();
+  }
+
+  return {
+    lsr_products_fetched,
+    lsr_observations_parsed,
+    lsr_observations_upserted,
+    lsr_matches_inserted,
+  };
+}
+
+module.exports = { enrichAlertWithLsr, enrichWithLsr, runLsrPipeline };

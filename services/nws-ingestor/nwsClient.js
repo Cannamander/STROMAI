@@ -1,5 +1,6 @@
 const { fetch } = require('undici');
 const config = require('./config');
+const log = require('./logger');
 
 const MAX_RETRIES = 3;
 const INITIAL_BACKOFF_MS = 1000;
@@ -20,8 +21,8 @@ function featureId(f) {
 async function fetchOne(statesSlice, headers) {
   const areaParams = statesSlice.map((s) => `area=${encodeURIComponent(s)}`).join('&');
   const url = `${config.nwsBaseUrl}/alerts/active?status=actual&${areaParams}`;
-  if (config.logLevel === 'debug') {
-    console.error('[nwsClient] GET', url.slice(0, 120) + (url.length > 120 ? '...' : ''));
+  if (log.isDebug()) {
+    log.debugLine('[nwsClient] GET ' + url.slice(0, 120) + (url.length > 120 ? '...' : ''));
   }
   const res = await fetch(url, { headers });
   if (res.status === 429 || (res.status >= 500 && res.status < 600)) {
@@ -49,32 +50,37 @@ async function fetchActiveAlerts() {
     Accept: 'application/geo+json',
   };
 
-  const seenIds = new Set();
-  const allFeatures = [];
-
+  const chunks = [];
   for (let i = 0; i < states.length; i += STATES_PER_REQUEST) {
-    const slice = states.slice(i, i + STATES_PER_REQUEST);
+    chunks.push(states.slice(i, i + STATES_PER_REQUEST));
+  }
+
+  async function fetchChunkWithRetry(slice) {
     let lastError;
     for (let attempt = 1; attempt <= MAX_RETRIES; attempt++) {
       try {
-        const data = await fetchOne(slice, headers);
-        const features = Array.isArray(data.features) ? data.features : [];
-        for (const f of features) {
-          const id = featureId(f);
-          if (!seenIds.has(id)) {
-            seenIds.add(id);
-            allFeatures.push(f);
-          }
-        }
-        break;
+        return await fetchOne(slice, headers);
       } catch (err) {
         lastError = err;
         if (attempt < MAX_RETRIES && (err.message.includes('429') || err.message.includes('5'))) {
-          const backoffMs = INITIAL_BACKOFF_MS * Math.pow(2, attempt - 1);
-          await sleep(backoffMs);
+          await sleep(INITIAL_BACKOFF_MS * Math.pow(2, attempt - 1));
         } else {
           throw lastError || new Error('Failed to fetch NWS alerts');
         }
+      }
+    }
+  }
+
+  const results = await Promise.all(chunks.map((slice) => fetchChunkWithRetry(slice)));
+  const seenIds = new Set();
+  const allFeatures = [];
+  for (const data of results) {
+    const features = Array.isArray(data.features) ? data.features : [];
+    for (const f of features) {
+      const id = featureId(f);
+      if (!seenIds.has(id)) {
+        seenIds.add(id);
+        allFeatures.push(f);
       }
     }
   }

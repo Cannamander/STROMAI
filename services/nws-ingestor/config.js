@@ -30,10 +30,11 @@ function parseEvents(envValue) {
   return envValue.split(',').map((s) => s.trim()).filter(Boolean);
 }
 
-/** Parse NWS_STATES (comma-separated state codes). Default TX if unset. */
-function parseStates() {
-  if (process.env.NWS_STATES != null && String(process.env.NWS_STATES).trim() !== '') {
-    return process.env.NWS_STATES
+/** Parse NWS_AREA or NWS_STATES (comma-separated state codes). Default TX if unset. */
+function parseArea() {
+  const raw = process.env.NWS_AREA ?? process.env.NWS_STATES ?? '';
+  if (raw != null && String(raw).trim() !== '') {
+    return String(raw)
       .split(',')
       .map((s) => s.trim())
       .filter(Boolean)
@@ -42,7 +43,7 @@ function parseStates() {
   return ['TX'];
 }
 
-const nwsStates = parseStates();
+const nwsStates = parseArea();
 
 module.exports = {
   databaseUrl: process.env.DATABASE_URL,
@@ -50,10 +51,18 @@ module.exports = {
   nwsUserAgent: process.env.NWS_USER_AGENT || 'AI-STORMS (https://creativedash.ai, tavis@creativedash.ai)',
   nwsPollSeconds: Math.max(60, parseInt(process.env.NWS_POLL_SECONDS, 10) || 120),
   nwsStates,
+  /** @deprecated All events ingested; used only for legacy or warning-detection. */
   allowedEvents: parseEvents(process.env.NWS_EVENTS),
   includeWatch: process.env.INCLUDE_WATCH === 'true' || process.env.INCLUDE_WATCH === '1',
   logLevel: process.env.LOG_LEVEL || 'info',
   dryRun: process.env.DRY_RUN === 'true' || process.env.DRY_RUN === '1',
-  lsrLookbackHours: Math.max(1, parseInt(process.env.LSR_LOOKBACK_HOURS, 10) || 12),
+  lsrLookbackHours: Math.max(1, parseInt(process.env.LSR_LOOKBACK_HOURS, 10) || 48),
   lsrTimeSlopHours: Math.max(0, parseInt(process.env.LSR_TIME_SLOP_HOURS, 10) || 2),
+  /** Hours before effective and after expires for LSR time window (warnings). */
+  alertLsrTimeBufferHours: Math.max(0, parseInt(process.env.ALERT_LSR_TIME_BUFFER_HOURS, 10) || 2),
+  /** Max distance (meters) for ST_DWithin match when geom present. */
+  alertLsrDistanceMeters: Math.max(100, parseInt(process.env.ALERT_LSR_DISTANCE_METERS, 10) || 30000),
+  storeSnapshots: process.env.NWS_STORE_SNAPSHOTS !== 'false' && process.env.NWS_STORE_SNAPSHOTS !== '0',
+  inferZip: process.env.INFER_ZIP !== 'false' && process.env.INFER_ZIP !== '0',
+  inferZipGeocode: process.env.INFER_ZIP_GEOCODE === 'true' || process.env.INFER_ZIP_GEOCODE === '1',
 };

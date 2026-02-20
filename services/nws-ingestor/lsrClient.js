@@ -39,21 +39,25 @@ async function fetchProduct(productId) {
 }
 
 /**
- * Fetch recent LSR products (list then fetch each body). Does not throw on individual fetch failure.
+ * Fetch recent LSR products (list then fetch all bodies in parallel). Does not throw on individual fetch failure.
  * @returns {Promise<Array<{ productId: string, issuanceTime: string|null, productText: string }>>}
  */
 async function fetchRecentLsrProducts() {
   const list = await listLsrProductIds();
-  const out = [];
-  for (const { id, issuanceTime } of list) {
-    try {
-      const product = await fetchProduct(id);
-      if (product && (product.productText || '').trim()) out.push({ ...product, issuanceTime: product.issuanceTime || issuanceTime });
-    } catch (_) {
-      // skip failed product fetch
-    }
-  }
-  return out;
+  const results = await Promise.all(
+    list.map(async ({ id, issuanceTime }) => {
+      try {
+        const product = await fetchProduct(id);
+        if (product && (product.productText || '').trim()) {
+          return { ...product, issuanceTime: product.issuanceTime || issuanceTime };
+        }
+      } catch (_) {
+        // skip failed product fetch
+      }
+      return null;
+    })
+  );
+  return results.filter(Boolean);
 }
 
 module.exports = { listLsrProductIds, fetchProduct, fetchRecentLsrProducts };

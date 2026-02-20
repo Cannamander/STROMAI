@@ -13,9 +13,30 @@ Polls NWS active alerts, filters to actionable warnings (and optionally watches)
 - **NWS_EVENTS** – Comma-separated list of NWS event type names (exact spelling). Defaults include Hurricane Warning, Tropical Storm Warning, Storm Surge Warning, Blizzard Warning, Excessive Heat Warning, Coastal/Lakeshore Flood Warning, Dense Fog Advisory, plus the original warnings/advisories. Override in `.env` to add or drop types.
 - **INCLUDE_WATCH** – Set `true` to treat “… Watch” events as actionable (default `false`)
 - **DRY_RUN** – Set `true` to skip DB writes
-- **LOG_LEVEL** – `info` or `debug`
+- **LOG_LEVEL** – `info` (default), `debug`, or `trace`. Info: run header, one line per alert, run summary. Debug: adds ZIP/zones sample per alert. Trace: adds single-line JSON summary at end.
+- **LOG_ZIP_SAMPLE_SIZE** – Number of ZIPs to show in debug sample (default 10)
+- **LOG_ZIP_FULL** – Set `true` with debug/trace to print full ZIP list (chunked, see LOG_ZIP_FULL_MAX)
+- **LOG_ZIP_FULL_MAX** – Max ZIPs to print when LOG_ZIP_FULL=true (default 200)
 - **LSR_LOOKBACK_HOURS** – Hours to look back for LSR products (default 12)
 - **LSR_TIME_SLOP_HOURS** – Hours before/after alert effective/expires to match LSR entry time (default 2)
+- **NWS_STORE_SNAPSHOTS** – Set `false` or `0` to disable writing a row to `nws_poll_snapshots` each run (default: store). Use when running persistently for map overlay / time-window logs / alerts.
+- **INFER_ZIP** – Set `false` or `0` to disable inferring ZIPs when the alert has no geometry (default: on). When on, we use **zone (UGC)** and optionally **city+state** to resolve ZIPs.
+- **INFER_ZIP_GEOCODE** – Set `true` or `1` to geocode **city + state** to a point and resolve the containing ZCTA when there is no geometry and no UGC match. Uses Nominatim (no API key); respect rate limits.
+
+## Logging
+
+All output goes through **services/nws-ingestor/logger.js**. Layout: one **run header** block, exactly **one [ALERT] line per actionable alert**, then one **run summary** block (counters, timing, exit status). No raw payloads; ZIPs are counts only at INFO. See **LOG_EXAMPLES.md** in this directory for example INFO and DEBUG output.
+
+## Inferring ZIPs when NWS sends no geometry
+
+When an alert has **state, city, and/or zone (UGC)** but no polygon, we can still resolve ZIPs:
+
+1. **Zone (UGC)** – If NWS sends `geocode.UGC` (e.g. `NJZ001`, `PAZ054`), we resolve ZIPs by:
+   - Looking up **ugc_zips** (if the table is populated), or
+   - **Fetching zone geometry** from `api.weather.gov/zones/forecast/{ugc}` (or `/zones/county/{ugc}` for county codes), then running the same PostGIS ZCTA intersection. Results are cached in **ugc_zips** for future runs. Run migration `004_ugc_zips.sql` so the cache table exists.
+2. **City + state** – If `INFER_ZIP_GEOCODE=true` and the alert has city and state, we geocode to a point (Nominatim) and return the ZCTA containing that point. One ZIP per city; rate-limited.
+
+The readout shows `zips=N (inferred)` when ZIPs came from UGC or geocode instead of polygon intersection.
 
 ## Event types (NWS_EVENTS)
 
@@ -37,6 +58,7 @@ To see what NWS actually sends, run `npm run nws:once` and check the verificatio
 - **public.nws_alerts** – Raw NWS alerts (actionable-only); existing schema unchanged.
 - **public.alert_impacted_zips** – One row per actionable alert with derived ZIP list from PostGIS intersection with **public.zcta5_raw** (ZCTA shapes, GIST index on `geom`). Columns: `alert_id`, `event`, `headline`, `severity`, `sent`, `effective`, `expires`, `geom_present`, `zips` (text[]), `created_at`. Unique on `alert_id`; reruns upsert.
 - **public.nws_alert_lsr** – LSR (Local Storm Report) entries matched to alerts: point-in-polygon + time window. Columns: `alert_id`, `lsr_product_id`, `entry_time`, `point_geom`, `hail_in`, `wind_gust_mph`, `raw_text`, `raw_text_hash`, `created_at`. Unique on `(alert_id, lsr_product_id, entry_time, raw_text_hash)`.
+- **public.nws_poll_snapshots** – One row per poll (e.g. every 15 min). Columns: `polled_at`, `duration_ms`, `fetched_count`, `actionable_count`, `geom_present_count`, `total_zips_mapped`, `impact_inserted`, `impact_updated`, LSR counts, `alert_summaries` (jsonb array of `{ id, event, headline, area_desc, expires_iso, zip_count, geom_present }`). Index on `polled_at DESC`. Lightweight time-series for map overlay, time-window logs, and alerting.
 
 ## Migrations
 
@@ -46,7 +68,29 @@ Run once against your Supabase Postgres (e.g. SQL Editor or `psql`):
 # From repo root
 psql "$DATABASE_URL" -f services/nws-ingestor/migrations/001_alert_impacted_zips.sql
 psql "$DATABASE_URL" -f services/nws-ingestor/migrations/002_nws_alert_lsr.sql
+psql "$DATABASE_URL" -f services/nws-ingestor/migrations/003_nws_poll_snapshots.sql
+psql "$DATABASE_URL" -f services/nws-ingestor/migrations/004_ugc_zips.sql
+psql "$DATABASE_URL" -f services/nws-ingestor/migrations/005_alert_impacted_states_lsr_summary.sql
+psql "$DATABASE_URL" -f services/nws-ingestor/migrations/006_nws_lsr_observations.sql
+psql "$DATABASE_URL" -f services/nws-ingestor/migrations/007_nws_alert_lsr_matches.sql
 ```
+Then populate **ugc_zips** (UGC code → ZIP list) if you want ZIP inference when alerts have no geometry; see “Inferring ZIPs when NWS sends no geometry” above.
+
+## Using poll snapshots (map overlay, time windows, alerts)
+
+When the ingestor runs persistently (e.g. `npm run nws:poll` every 15 minutes), each run appends one row to **nws_poll_snapshots** (unless `NWS_STORE_SNAPSHOTS=false`). That gives you a time-series of what was active at each poll.
+
+- **Map overlay** – For “current” view, use `nws_alerts` + `alert_impacted_zips` (and geometry from `nws_alerts.geometry_json`). For “what was active in the last 6 hours,” query snapshots:  
+  `SELECT polled_at, alert_summaries FROM nws_poll_snapshots WHERE polled_at > now() - interval '6 hours' ORDER BY polled_at DESC;`  
+  Then resolve alert IDs to geometries from `nws_alerts` or `alert_impacted_zips` for drawing.
+
+- **Log of weather events for a time window** –  
+  `SELECT polled_at, actionable_count, alert_summaries FROM nws_poll_snapshots WHERE polled_at BETWEEN $1 AND $2 ORDER BY polled_at;`  
+  Each row’s `alert_summaries` is an array of compact alert info (event, headline, area_desc, expires_iso, zip_count) for that poll.
+
+- **Alerts (e.g. “new severe event”)** – Compare latest snapshot to the previous one (e.g. new `id` in `alert_summaries`), or watch `actionable_count` / specific event types in `alert_summaries` and trigger notifications.
+
+At 15-minute intervals you get ~96 rows/day; retention is up to you (e.g. drop rows older than 30 days with a cron or scheduled job).
 
 ## Commands
 
@@ -86,8 +130,9 @@ These are the test commands baked into the codebase. Use them to validate each p
    - Fetches from NWS for every state in `NWS_STATES` (e.g. all 50).  
    - Keeps only actionable warnings (and watches if `INCLUDE_WATCH=true`).  
    - For each alert: if geometry exists, runs PostGIS intersection with ZCTA and writes ZIPs to `alert_impacted_zips`; if no geometry, writes `geom_present=false` and empty `zips`.  
-   - Logs one line per alert: `event | area_desc | geom=... | zips=<count> | sent=... | expires=...`  
-   - Under each alert with ZIPs: `  → 77001, 77002, ...` (up to 40 shown, then "+N more").  
+   - **State** in the log line comes from NWS geocode (UGC/FIPS6) when present; otherwise we try to parse 2-letter codes from `area_desc`.  
+   - Logs one line per alert: `[warning|watch] event | state=... | area_desc | geom=... | zips=<count> | sent=... | expires=...`  
+   - Under each alert with ZIPs: `  → zips: 77001, 77002, ...` (up to 40 shown, then "+N more").  
    - LSR enrichment runs after impact: fetches recent LSR products, parses hail/wind/points, matches to alerts (point-in-polygon + time window), inserts into `nws_alert_lsr`. Failures are logged and do not block the run.
    - Final line: JSON includes `lsr_products_fetched`, `lsr_entries_parsed`, `lsr_entries_with_points`, `lsr_matches_inserted`, plus existing counts and `duration_ms`.
 
@@ -119,3 +164,9 @@ These are the test commands baked into the codebase. Use them to validate each p
    ORDER BY created_at DESC
    LIMIT 20;
    ```
+
+## Why no geometry / no ZIPs / state=? in practice
+
+- **Geometry**: Many NWS active alerts are issued with **county or zone names only** and do **not** include a polygon in the GeoJSON. The API returns `geometry: null` for those. Our PostGIS→ZIP logic works when geometry is present (and is tested with fake polygons in `npm run nws:test-zips`); when it’s null we correctly show `geom=false` and `zips=0 (no geometry)`.
+- **State**: We derive state from NWS **geocode** (UGC or FIPS6 in `feature.properties.geocode`) when the API includes it. If the response has no geocode or a different shape, we fall back to parsing 2-letter codes from `area_desc` (e.g. "County; TX"); county-only text like "Sussex; Carbon; Monroe" has no state abbreviation, so you may see `state=?` until the API sends geocode or state in the text.
+- To confirm what NWS sends for a given run, inspect `raw_json` (or the API response) for one alert; the ingestor stores the full feature in `nws_alerts.raw_json`.
