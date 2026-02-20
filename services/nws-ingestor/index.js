@@ -191,7 +191,7 @@ async function ingestOnce(opts = {}) {
                 z = await getZipsByGeometry(geom);
                 if (z.length > 0) await insertUgcZips(ugc, z);
               }
-              await new Promise((r) => setTimeout(r, 200));
+              if (config.inferZipDelayMs > 0) await new Promise((r) => setTimeout(r, config.inferZipDelayMs));
             }
             z.forEach((zip) => combined.add(zip));
           }
@@ -225,28 +225,13 @@ async function ingestOnce(opts = {}) {
     impact_inserted = impactResult.inserted_count;
     impact_updated = impactResult.updated_count;
 
-    try {
-      t0 = Date.now();
-      const lsrResult = await runLsrPipeline();
-      timings.lsr_ms = Date.now() - t0;
-      lsr_products_fetched = lsrResult.lsr_products_fetched;
-      lsr_entries_parsed = lsrResult.lsr_observations_parsed;
-      lsr_entries_with_points = lsrResult.lsr_observations_upserted;
-      lsr_matches_inserted = lsrResult.lsr_matches_inserted;
-    } catch (lsrErr) {
-      errorsCount++;
-      log.errorMsg('LSR pipeline failed: ' + (lsrErr && lsrErr.message));
-    }
-
+    // Log [ALERT] lines immediately (use current DB LSR state); run LSR pipeline after so output appears faster
     const alertIds = impactRows.map((r) => r.id);
     let lsrByAlertId = {};
     try {
       const summaries = await getAlertLsrSummaries(alertIds);
       for (const s of summaries) lsrByAlertId[s.alert_id] = s;
     } catch (_) {}
-
-    const duration_ms = Date.now() - start;
-    timings.total_ms = duration_ms;
 
     for (const row of impactRows) {
       const alertRow = withFutureExpires.find((r) => r.id === row.id);
@@ -282,6 +267,22 @@ async function ingestOnce(opts = {}) {
         log.alertDetailsDebug({ zips: row.zips || [], zones: parseUgcs(alertRow?.location?.zone || '') });
       }
     }
+
+    try {
+      t0 = Date.now();
+      const lsrResult = await runLsrPipeline();
+      timings.lsr_ms = Date.now() - t0;
+      lsr_products_fetched = lsrResult.lsr_products_fetched;
+      lsr_entries_parsed = lsrResult.lsr_observations_parsed;
+      lsr_entries_with_points = lsrResult.lsr_observations_upserted;
+      lsr_matches_inserted = lsrResult.lsr_matches_inserted;
+    } catch (lsrErr) {
+      errorsCount++;
+      log.errorMsg('LSR pipeline failed: ' + (lsrErr && lsrErr.message));
+    }
+
+    const duration_ms = Date.now() - start;
+    timings.total_ms = duration_ms;
 
     const counters = {
       fetched_count,

@@ -64,5 +64,7 @@ module.exports = {
   alertLsrDistanceMeters: Math.max(100, parseInt(process.env.ALERT_LSR_DISTANCE_METERS, 10) || 30000),
   storeSnapshots: process.env.NWS_STORE_SNAPSHOTS !== 'false' && process.env.NWS_STORE_SNAPSHOTS !== '0',
   inferZip: process.env.INFER_ZIP !== 'false' && process.env.INFER_ZIP !== '0',
+  /** Delay (ms) between NWS zone geometry fetches when inferring ZIPs. Lower = faster; 0 = no delay. Default 50. */
+  inferZipDelayMs: process.env.INFER_ZIP_DELAY_MS === '0' ? 0 : Math.max(0, parseInt(process.env.INFER_ZIP_DELAY_MS, 10) || 50),
   inferZipGeocode: process.env.INFER_ZIP_GEOCODE === 'true' || process.env.INFER_ZIP_GEOCODE === '1',
 };

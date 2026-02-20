@@ -154,16 +154,20 @@ These are the test commands baked into the codebase. Use them to validate each p
    - Prints: products fetched, entries parsed, entries with points, sample lines.  
    - If `nws_alerts` has at least one row with geometry, runs point-in-polygon for parsed LSR entries and reports how many matches were inserted into `nws_alert_lsr`.
 
-2. **Full flow**  
+2. **Full LSR pipeline** — `npm run nws:test-lsr-pipeline` runs the same pipeline as ingest: list/fetch LSR products, parse to `nws_lsr_observations`, set-based match (warnings only), update summaries. Prints counts and a sample of warnings with `lsr_match_count`. If no products, try `LSR_LOOKBACK_HOURS=168`.
+
+3. **Full flow**  
    Run `npm run nws:once` when there are actionable alerts. The final JSON line includes `lsr_products_fetched`, `lsr_entries_parsed`, `lsr_entries_with_points`, `lsr_matches_inserted`. Non-zero `lsr_matches_inserted` means at least one LSR report fell inside an alert’s geometry and time window.
 
-3. **Inspect LSR matches in DB**  
-   ```sql
-   SELECT alert_id, lsr_product_id, entry_time, hail_in, wind_gust_mph, LEFT(raw_text, 80) AS raw_preview
-   FROM public.nws_alert_lsr
-   ORDER BY created_at DESC
-   LIMIT 20;
-   ```
+4. **Inspect LSR in DB** (queries below)  
+   - New pipeline (warnings + observations):  
+     `SELECT alert_id, event, lsr_match_count, hail_max_inches, wind_max_mph FROM public.alert_impacted_zips WHERE event LIKE '% Warning' AND lsr_match_count > 0;`  
+   - Matches:  
+     `SELECT * FROM public.nws_alert_lsr_matches ORDER BY matched_at DESC LIMIT 20;`  
+   - Observations:  
+     `SELECT observation_id, event_type, state, hail_inches, wind_mph, occurred_at FROM public.nws_lsr_observations ORDER BY occurred_at DESC LIMIT 20;`
+   - Legacy table (old point-in-polygon):  
+     `SELECT alert_id, lsr_product_id, entry_time, hail_in, wind_gust_mph FROM public.nws_alert_lsr ORDER BY created_at DESC LIMIT 20;`
 
 ## Why no geometry / no ZIPs / state=? in practice
 

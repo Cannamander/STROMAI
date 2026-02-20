@@ -7,7 +7,8 @@
     "nws:poll": "node services/nws-ingestor/index.js poll",
     "test": "node --test services/nws-ingestor/db.test.js services/nws-ingestor/lsrParser.test.js",
     "nws:test-zips": "node services/nws-ingestor/scripts/test-zip-lookup.js",
-    "nws:test-lsr": "node services/nws-ingestor/scripts/test-lsr-enrichment.js"
+    "nws:test-lsr": "node services/nws-ingestor/scripts/test-lsr-enrichment.js",
+    "nws:test-lsr-pipeline": "node services/nws-ingestor/scripts/test-lsr-pipeline.js"
   },
   "dependencies": {
     "dotenv": "^16.3.1",
