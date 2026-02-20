@@ -1,10 +1,19 @@
 require('dotenv').config();
 
 const DEFAULT_EVENTS = [
-  'Severe Thunderstorm Warning',
   'Tornado Warning',
+  'Severe Thunderstorm Warning',
   'Flash Flood Warning',
   'High Wind Warning',
+  'Ice Storm Warning',
+  'Winter Storm Warning',
+  'Hard Freeze Warning',
+  'Freeze Warning',
+  'Extreme Cold Warning',
+  'Wind Chill Warning',
+  'Winter Weather Advisory',
+  'Wind Chill Advisory',
+  'Frost Advisory',
 ];
 
 function parseEvents(envValue) {
@@ -12,7 +21,7 @@ function parseEvents(envValue) {
   return envValue.split(',').map((s) => s.trim()).filter(Boolean);
 }
 
-/** NWS_STATES overrides NWS_AREA. Source of truth for multi-state polling. */
+/** Parse NWS_STATES (comma-separated state codes). Default TX if unset. */
 function parseStates() {
   if (process.env.NWS_STATES != null && String(process.env.NWS_STATES).trim() !== '') {
     return process.env.NWS_STATES
@@ -20,9 +29,6 @@ function parseStates() {
       .map((s) => s.trim())
       .filter(Boolean)
       .map((s) => s.toUpperCase());
-  }
-  if (process.env.NWS_AREA != null && String(process.env.NWS_AREA).trim() !== '') {
-    return [process.env.NWS_AREA.trim().toUpperCase()];
   }
   return ['TX'];
 }
@@ -34,7 +40,6 @@ module.exports = {
   nwsBaseUrl: (process.env.NWS_BASE_URL || 'https://api.weather.gov').replace(/\/$/, ''),
   nwsUserAgent: process.env.NWS_USER_AGENT || 'AI-STORMS (https://creativedash.ai, tavis@creativedash.ai)',
   nwsPollSeconds: Math.max(60, parseInt(process.env.NWS_POLL_SECONDS, 10) || 120),
-  nwsArea: process.env.NWS_AREA || 'TX',
   nwsStates,
   allowedEvents: parseEvents(process.env.NWS_EVENTS),
   includeWatch: process.env.INCLUDE_WATCH === 'true' || process.env.INCLUDE_WATCH === '1',

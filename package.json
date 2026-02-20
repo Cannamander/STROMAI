@@ -4,7 +4,9 @@
   "private": true,
   "scripts": {
     "nws:once": "node services/nws-ingestor/index.js once",
-    "nws:poll": "node services/nws-ingestor/index.js poll"
+    "nws:poll": "node services/nws-ingestor/index.js poll",
+    "test": "node --test services/nws-ingestor/db.test.js",
+    "nws:test-zips": "node services/nws-ingestor/scripts/test-zip-lookup.js"
   },
   "dependencies": {
     "dotenv": "^16.3.1",

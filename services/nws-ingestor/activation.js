@@ -1,18 +1,13 @@
 const config = require('./config');
 
-/** Warnings that are actionable by default (no INCLUDE_WATCH needed). */
-const WARNING_ALLOWLIST = [
-  'Tornado Warning',
-  'Severe Thunderstorm Warning',
-  'Flash Flood Warning',
-  'High Wind Warning',
-  'Hurricane Warning',
-  'Ice Storm Warning',
-  'Winter Storm Warning',
-];
+/** Event types we treat as actionable (from NWS_EVENTS env or default). */
+function getAllowedEventsSet() {
+  const list = config.allowedEvents || [];
+  return new Set(list.map((e) => String(e).trim()));
+}
 
 /**
- * Classify a normalized alert for activation (warnings-only by default, watches optional).
+ * Classify a normalized alert for activation. Actionable = event in NWS_EVENTS, or (if INCLUDE_WATCH) event ends in "Watch".
  * @param {object} alert - Normalized alert (must have status, messageType, event)
  * @returns {{ actionable: boolean, kind: 'warning'|'watch'|'other', reason: string }}
  */
@@ -32,14 +27,15 @@ function classifyAlert(alert) {
     return { actionable: false, kind: 'other', reason: 'messageType is Cancel' };
   }
 
-  if (WARNING_ALLOWLIST.includes(event)) {
-    return { actionable: true, kind: 'warning', reason: 'warning allowlist' };
+  const allowed = getAllowedEventsSet();
+  if (allowed.has(event)) {
+    return { actionable: true, kind: 'warning', reason: 'in NWS_EVENTS' };
   }
   if (config.includeWatch && event.endsWith('Watch')) {
     return { actionable: true, kind: 'watch', reason: 'watch (INCLUDE_WATCH=true)' };
   }
 
-  return { actionable: false, kind: 'other', reason: 'not warning or watch' };
+  return { actionable: false, kind: 'other', reason: 'not in NWS_EVENTS or watch' };
 }
 
 /**
@@ -50,4 +46,4 @@ function isActionable(alert) {
   return classifyAlert(alert).actionable;
 }
 
-module.exports = { classifyAlert, isActionable, WARNING_ALLOWLIST };
+module.exports = { classifyAlert, isActionable, getAllowedEventsSet };
