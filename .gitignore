@@ -2,6 +2,8 @@
 .env
 .env.*
 !.env.example
+# Typo / legacy (use .gitignore only)
+,gitignore
 
 # Dependencies
 node_modules/
