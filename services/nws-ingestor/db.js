@@ -216,7 +216,8 @@ const IMPACT_UPSERT_SQL = `
     geo_method = EXCLUDED.geo_method,
     zip_inference_method = EXCLUDED.zip_inference_method,
     affected_zones_count = EXCLUDED.affected_zones_count,
-    ugc_count = EXCLUDED.ugc_count
+    ugc_count = EXCLUDED.ugc_count,
+    last_seen_at = now()
 `;
 
 /**
@@ -702,11 +703,23 @@ async function getAlerts(filters = {}) {
     conditions.push(`(area_sq_miles IS NULL OR area_sq_miles <= $${i++})`);
     params.push(Number(filters.max_area_sq_miles));
   }
+  if (filters.since_last_ingest === true) {
+    conditions.push('((SELECT updated_at FROM public.last_ingest_run WHERE id = 1 LIMIT 1) IS NULL OR last_seen_at >= (SELECT updated_at FROM public.last_ingest_run WHERE id = 1 LIMIT 1))');
+  }
   const where = conditions.length ? ' WHERE ' + conditions.join(' AND ') : '';
   const orderBy = buildAlertsOrderBy(filters);
   const sql = `SELECT * FROM public.alert_impacted_zips ${where} ORDER BY ${orderBy} LIMIT 500`;
   const { rows } = await pool.query(sql, params);
   return rows;
+}
+
+/**
+ * Set last_ingest_run timestamp (called at start of "run ingest once"). Dashboard can filter to alerts with last_seen_at >= this.
+ */
+async function setLastIngestRun() {
+  await pool.query(
+    'INSERT INTO public.last_ingest_run (id, updated_at) VALUES (1, now()) ON CONFLICT (id) DO UPDATE SET updated_at = now()'
+  );
 }
 
 /** Whitelist for column sort; maps to safe SQL expression. */
@@ -1007,6 +1020,206 @@ async function insertPollSnapshot(summary, alertSummaries) {
   ]);
 }
 
+const MAP_ALERTS_LIMIT = 300;
+const MAP_ZIPS_LIMIT = 2500;
+
+/**
+ * Map: GeoJSON FeatureCollection of alert polygons (geom_present only).
+ * @param {object} opts - states (string[]), since_hours (number), warnings_only (bool), interesting_only (bool), min_score (number), bbox [minLon, minLat, maxLon, maxLat]
+ */
+async function getMapAlerts(opts = {}) {
+  const conditions = ['p.geom_present = true', 'n.geometry_json IS NOT NULL'];
+  const params = [];
+  let i = 1;
+  if (opts.states && Array.isArray(opts.states) && opts.states.length > 0) {
+    conditions.push(`p.impacted_states && $${i}::text[]`);
+    params.push(opts.states.map((s) => String(s).trim().toUpperCase()).filter(Boolean));
+    i++;
+  }
+  if (opts.since_hours != null && !Number.isNaN(Number(opts.since_hours))) {
+    conditions.push(`(p.expires IS NULL OR p.expires > now() - ($${i}::numeric || ' hours')::interval)`);
+    params.push(Number(opts.since_hours));
+    i++;
+  }
+  if (opts.warnings_only === true) {
+    conditions.push("COALESCE(p.alert_class, 'other') = 'warning'");
+  }
+  if (opts.interesting_only === true) {
+    conditions.push('p.interesting_any = true');
+  }
+  if (opts.min_score != null && !Number.isNaN(Number(opts.min_score))) {
+    conditions.push(`COALESCE(p.damage_score, 0) >= $${i}`);
+    params.push(Number(opts.min_score));
+    i++;
+  }
+  if (opts.since_last_ingest === true) {
+    conditions.push('((SELECT updated_at FROM public.last_ingest_run WHERE id = 1 LIMIT 1) IS NULL OR p.last_seen_at >= (SELECT updated_at FROM public.last_ingest_run WHERE id = 1 LIMIT 1))');
+  }
+  if (opts.bbox && Array.isArray(opts.bbox) && opts.bbox.length >= 4) {
+    const [minLon, minLat, maxLon, maxLat] = opts.bbox.map(Number);
+    if (![minLon, minLat, maxLon, maxLat].some(Number.isNaN)) {
+      conditions.push(`ST_Intersects(ST_SetSRID(ST_GeomFromGeoJSON(n.geometry_json::text), 4326), ST_MakeEnvelope($${i}, $${i + 1}, $${i + 2}, $${i + 3}, 4326))`);
+      params.push(minLon, minLat, maxLon, maxLat);
+      i += 4;
+    }
+  }
+  const where = conditions.join(' AND ');
+  params.push(MAP_ALERTS_LIMIT);
+  const sql = `
+    SELECT p.alert_id, p.event, p.headline, p.alert_class, p.severity, p.expires, p.zip_count, p.damage_score, p.interesting_any, p.lsr_match_count, n.geometry_json
+    FROM public.alert_impacted_zips p
+    JOIN public.nws_alerts n ON n.id = p.alert_id
+    WHERE ${where}
+    ORDER BY COALESCE(p.damage_score, 0) DESC, p.expires ASC NULLS LAST
+    LIMIT $${i}
+  `;
+  const { rows } = await pool.query(sql, params);
+  const features = (rows || []).map((r) => {
+    const geom = r.geometry_json;
+    if (!geom || typeof geom !== 'object') return null;
+    return {
+      type: 'Feature',
+      geometry: geom,
+      properties: {
+        alert_id: r.alert_id,
+        event: r.event,
+        headline: r.headline,
+        alert_class: r.alert_class,
+        severity: r.severity,
+        expires: r.expires,
+        zip_count: r.zip_count,
+        damage_score: r.damage_score,
+        interesting_any: r.interesting_any,
+        lsr_match_count: r.lsr_match_count,
+      },
+    };
+  }).filter(Boolean);
+  return { type: 'FeatureCollection', features };
+}
+
+/**
+ * Map: GeoJSON FeatureCollection of ZIP centroid points (aggregated by zip).
+ */
+async function getMapZips(opts = {}) {
+  const conditions = [];
+  const params = [];
+  let i = 1;
+  if (opts.states && Array.isArray(opts.states) && opts.states.length > 0) {
+    conditions.push(`p.impacted_states && $${i}::text[]`);
+    params.push(opts.states.map((s) => String(s).trim().toUpperCase()).filter(Boolean));
+    i++;
+  }
+  if (opts.since_hours != null && !Number.isNaN(Number(opts.since_hours))) {
+    conditions.push(`(p.expires IS NULL OR p.expires > now() - ($${i}::numeric || ' hours')::interval)`);
+    params.push(Number(opts.since_hours));
+    i++;
+  }
+  if (opts.warnings_only === true) {
+    conditions.push("COALESCE(p.alert_class, 'other') = 'warning'");
+  }
+  if (opts.interesting_only === true) {
+    conditions.push('p.interesting_any = true');
+  }
+  if (opts.min_score != null && !Number.isNaN(Number(opts.min_score))) {
+    conditions.push(`COALESCE(p.damage_score, 0) >= $${i}`);
+    params.push(Number(opts.min_score));
+    i++;
+  }
+  if (opts.since_last_ingest === true) {
+    conditions.push('((SELECT updated_at FROM public.last_ingest_run WHERE id = 1 LIMIT 1) IS NULL OR p.last_seen_at >= (SELECT updated_at FROM public.last_ingest_run WHERE id = 1 LIMIT 1))');
+  }
+  if (opts.prefer_polygons === true) {
+    conditions.push('p.geom_present = false');
+  }
+  const where = conditions.length ? ' WHERE ' + conditions.join(' AND ') : '';
+  let bboxJoin = '';
+  if (opts.bbox && Array.isArray(opts.bbox) && opts.bbox.length >= 4) {
+    const [minLon, minLat, maxLon, maxLat] = opts.bbox.map(Number);
+    if (![minLon, minLat, maxLon, maxLat].some(Number.isNaN)) {
+      params.push(minLon, minLat, maxLon, maxLat);
+      bboxJoin = `AND ST_Intersects(c.geom, ST_MakeEnvelope($${i}, $${i + 1}, $${i + 2}, $${i + 3}, 4326))`;
+      i += 4;
+    }
+  }
+  params.push(MAP_ZIPS_LIMIT);
+  const sql = `
+    WITH expanded AS (
+      SELECT unnest(p.zips) AS zip, p.alert_id, p.event, p.headline, COALESCE(p.damage_score, 0) AS damage_score, p.interesting_any
+      FROM public.alert_impacted_zips p
+      ${where}
+    ),
+    zip_agg AS (
+      SELECT
+        zip,
+        count(*)::int AS alert_count,
+        max(damage_score)::int AS max_score,
+        bool_or(interesting_any) AS has_interesting,
+        (SELECT array_agg(ev) FROM (SELECT DISTINCT event AS ev FROM expanded e2 WHERE e2.zip = expanded.zip LIMIT 3) _) AS top_events,
+        (SELECT array_agg(aid) FROM (SELECT alert_id AS aid FROM expanded e2 WHERE e2.zip = expanded.zip ORDER BY damage_score DESC NULLS LAST LIMIT 5) _) AS top_alert_ids,
+        (SELECT array_agg(hl) FROM (SELECT headline AS hl FROM expanded e2 WHERE e2.zip = expanded.zip ORDER BY damage_score DESC NULLS LAST LIMIT 5) _) AS top_headlines
+      FROM expanded
+      GROUP BY zip
+    )
+    SELECT c.zcta5ce20 AS zip, ST_X(c.geom) AS lon, ST_Y(c.geom) AS lat,
+           z.alert_count, z.max_score, z.has_interesting, z.top_events, z.top_alert_ids, z.top_headlines
+    FROM public.zcta5_centroids c
+    JOIN zip_agg z ON z.zip = c.zcta5ce20
+    WHERE 1=1 ${bboxJoin}
+    ORDER BY z.alert_count DESC
+    LIMIT $${i}
+  `;
+  const { rows } = await pool.query(sql, params);
+  const features = (rows || []).map((r) => ({
+    type: 'Feature',
+    geometry: { type: 'Point', coordinates: [Number(r.lon), Number(r.lat)] },
+    properties: {
+      zip: r.zip,
+      alert_count: r.alert_count,
+      max_score: r.max_score ?? 0,
+      has_interesting: !!r.has_interesting,
+      top_events: (r.top_events || []).slice(0, 3),
+      top_alert_ids: (r.top_alert_ids || []).slice(0, 5),
+      top_headlines: (r.top_headlines || []).slice(0, 5),
+    },
+  }));
+  return { type: 'FeatureCollection', features };
+}
+
+/**
+ * Map meta: default center, radar WMS config, time extent.
+ */
+async function getMapMeta(states = []) {
+  let default_center = [ -98.5, 39.5 ];
+  if (states && states.length > 0) {
+    try {
+      const { rows } = await pool.query(
+        `SELECT ST_X(ST_Centroid(ST_Union(geom))) AS lon, ST_Y(ST_Centroid(ST_Union(geom))) AS lat
+         FROM public.zcta5_centroids c
+         WHERE EXISTS (SELECT 1 FROM public.alert_impacted_zips p WHERE p.impacted_states && $1::text[] AND c.zcta5ce20 = ANY(p.zips) LIMIT 1)`,
+        [states.map((s) => String(s).trim().toUpperCase()).filter(Boolean)]
+      );
+      if (rows[0] && rows[0].lon != null && rows[0].lat != null) {
+        default_center = [ Number(rows[0].lon), Number(rows[0].lat) ];
+      }
+    } catch (_) {}
+  }
+  const radar_wms = {
+    baseUrl: process.env.RADAR_WMS_BASE_URL || '',
+    layers: process.env.RADAR_WMS_LAYERS || '',
+    format: process.env.RADAR_WMS_FORMAT || 'image/png',
+    transparent: process.env.RADAR_WMS_TRANSPARENT !== 'false',
+    time_supported: process.env.RADAR_TIME_ENABLED === 'true',
+  };
+  const now = new Date();
+  const start = new Date(now.getTime() - 2 * 60 * 60 * 1000);
+  const time_extent = {
+    start: start.toISOString(),
+    end: now.toISOString(),
+    step_minutes: 5,
+  };
+  return { default_center, radar_wms, time_extent };
+}
+
 async function closePool() {
   await pool.end();
 }
@@ -1037,8 +1250,12 @@ module.exports = {
   getAlertById,
   getAlerts,
   getAlertsByState,
+  setLastIngestRun,
   getStateSummary,
   getStatePlaces,
+  getMapAlerts,
+  getMapZips,
+  getMapMeta,
   tokenizeAreaDesc,
   normalizePlaceKey,
   buildAlertsOrderBy,

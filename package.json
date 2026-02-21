@@ -21,7 +21,9 @@
     "nws:test-lsr": "node services/nws-ingestor/scripts/test-lsr-enrichment.js",
     "nws:test-lsr-pipeline": "node services/nws-ingestor/scripts/test-lsr-pipeline.js",
     "api": "node services/nws-ingestor/api.js",
-    "worker": "node services/nws-ingestor/worker.js"
+    "worker": "node services/nws-ingestor/worker.js",
+    "test:map": "node --test services/nws-ingestor/map.test.js",
+    "test:map-api": "node --test services/nws-ingestor/map-api.test.js"
   },
   "dependencies": {
     "dotenv": "^16.3.1",

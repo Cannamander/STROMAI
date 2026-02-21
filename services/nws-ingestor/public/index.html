@@ -72,7 +72,19 @@
     .confidence-high { color: #22c55e; }
     .confidence-medium { color: #eab308; }
     .confidence-low { color: #71717a; }
+    .map-layout { display: grid; grid-template-columns: 280px 1fr; gap: 0; min-height: 75vh; }
+    .map-left { background: #18181b; border-right: 1px solid #27272a; padding: 1rem; overflow: auto; }
+    .map-left label { display: block; margin-top: 0.5rem; font-size: 0.875rem; }
+    .map-left input[type="text"], .map-left select { width: 100%; margin-top: 0.25rem; }
+    #map-container { min-height: 400px; width: 100%; }
+    .map-disclaimer { font-size: 0.75rem; color: #71717a; margin-top: 0.5rem; }
+    .leaflet-popup-content { margin: 0.5rem; font-size: 0.875rem; max-width: 360px; }
+    .map-popup-headline { display: block; font-weight: normal; color: #a1a1aa; font-size: 0.8rem; margin: 0.2rem 0; }
+    .map-polygon-tooltip { white-space: normal; max-width: 320px; font-size: 0.8rem; }
   </style>
+  <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css" />
+  <link rel="stylesheet" href="https://unpkg.com/leaflet.markercluster@1.5.3/dist/MarkerCluster.css" />
+  <link rel="stylesheet" href="https://unpkg.com/leaflet.markercluster@1.5.3/dist/MarkerCluster.Default.css" />
 </head>
 <body>
   <h1>AI-STORMS Operator</h1>
@@ -85,6 +97,7 @@
   </div>
   <nav id="nav" style="display:none;">
     <a href="#" data-page="dashboard" class="active">Dashboard</a>
+    <a href="#" data-page="map">Map</a>
     <a href="#" data-page="outbox">Outbox</a>
     <button id="logout-btn">Logout</button>
   </nav>
@@ -112,6 +125,7 @@
       <label><input type="checkbox" id="filter-lsr-only" /> LSR only</label>
       <label><input type="checkbox" id="filter-hide-geom-missing" /> Hide GEOM MISSING</label>
       <label><input type="checkbox" id="filter-active" /> Active only</label>
+      <label><input type="checkbox" id="filter-since-last-ingest" checked title="Only alerts from last Run ingest once (testing)" /> Only from last ingest run</label>
       <input type="number" id="filter-max-zip-count" placeholder="Max ZIPs" style="width:80px" title="max_zip_count" />
       <input type="number" id="filter-max-area" placeholder="Max area (sq mi)" style="width:100px" title="max_area_sq_miles" />
       <input type="text" id="filter-state" placeholder="State" style="width:60px" />
@@ -146,6 +160,45 @@
       <button id="queue-delivery-btn">Queue delivery</button>
     </p>
     <div id="detail-message"></div>
+  </section>
+
+  <section id="map">
+    <div class="map-layout">
+      <div class="map-left">
+        <p><strong>Filters</strong></p>
+        <label>States (comma, e.g. TX,OK)</label>
+        <input type="text" id="map-states" placeholder="TX, OK" />
+        <label><input type="checkbox" id="map-warnings-only" /> Warnings only</label>
+        <label><input type="checkbox" id="map-interesting-only" /> Interesting only</label>
+        <label>Min score (0–100)</label>
+        <input type="number" id="map-min-score" min="0" max="100" value="0" style="width:80px" />
+        <label>Since (hours)</label>
+        <input type="number" id="map-since-hours" min="1" value="48" style="width:80px" />
+        <label><input type="checkbox" id="map-since-last-ingest" checked title="Match dashboard: only alerts from last Run ingest once" /> Only from last ingest run</label>
+        <label><input type="checkbox" id="map-prefer-polygons" /> Prefer polygons (hide ZIP proxy where polygon exists)</label>
+        <p style="margin-top:1rem;"><strong>Layers</strong></p>
+        <label><input type="checkbox" id="map-layer-base" checked /> Base (OSM)</label>
+        <label><input type="checkbox" id="map-layer-radar" /> Radar (WMS)</label>
+        <label><input type="number" id="map-radar-opacity" min="0" max="100" value="70" style="width:60px" /> % opacity</label>
+        <label><input type="checkbox" id="map-layer-alerts" checked /> Alerts (polygons)</label>
+        <label><input type="checkbox" id="map-layer-zips" checked /> ZIP Coverage Proxy</label>
+        <p id="map-zip-disclaimer" class="map-disclaimer">ZIP Coverage Proxy: derived from impacted ZIP list, not official alert polygon.</p>
+        <label><input type="checkbox" id="map-layer-lsr" disabled /> LSR Points (future)</label>
+        <p style="margin-top:1rem;"><strong>Radar time</strong></p>
+        <div id="map-radar-time-ui" style="display:none;">
+          <span id="map-radar-time-label">—</span>
+          <button type="button" id="map-radar-play" title="Play">▶</button>
+          <button type="button" id="map-radar-pause" title="Pause" style="display:none;">⏸</button>
+          <label>Speed: <select id="map-radar-speed"><option value="0.5">0.5×</option><option value="1" selected>1×</option><option value="2">2×</option></select></label>
+        </div>
+        <p id="map-radar-no-time" class="map-disclaimer" style="display:none;">Radar time not supported by WMS.</p>
+        <button type="button" id="map-apply">Apply</button>
+        <p id="map-hint-no-polygons" class="map-disclaimer" style="display:none; margin-top:0.5rem;">No alert polygons in this run (ZIP layer shows coverage).</p>
+        <p id="map-hint-no-data" class="map-disclaimer" style="display:none; margin-top:0.5rem;">No events on map. Run &quot;Run ingest once&quot; on Dashboard, then click Apply. If using &quot;Only from last ingest run&quot;, run ingest first. Ensure <code>npm run migrate</code> has been run (zcta5_centroids for ZIP points).</p>
+        <p id="map-error" class="alert error" style="display:none; margin-top:0.5rem;"></p>
+      </div>
+      <div id="map-container"></div>
+    </div>
   </section>
 
   <section id="outbox">
@@ -191,6 +244,8 @@
     </div>
   </div>
 
+  <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
+  <script src="https://unpkg.com/leaflet.markercluster@1.5.3/dist/leaflet.markercluster.js"></script>
   <script src="app.js"></script>
 </body>
 </html>

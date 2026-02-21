@@ -6,7 +6,7 @@
  */
 require('dotenv').config();
 const express = require('express');
-const { getAlerts, getAlertById, enqueueDelivery, getOutbox, getOutboxById, getOutboxByState, updateOutboxRow, cancelOutboxRow, getStateSummary, getStatePlaces } = require('./db');
+const { getAlerts, getAlertById, enqueueDelivery, getOutbox, getOutboxById, getOutboxByState, updateOutboxRow, cancelOutboxRow, getStateSummary, getStatePlaces, getMapAlerts, getMapZips, getMapMeta, setLastIngestRun } = require('./db');
 const { buildDeliveryPayload } = require('./payloadBuilder');
 const { ingestOnce } = require('./index');
 
@@ -64,6 +64,7 @@ app.use(authMiddleware);
 // POST /v1/ingest/once – run NWS ingest once (fetch all alerts, derive ZIPs, LSR pipeline, thresholds)
 app.post('/v1/ingest/once', async (req, res) => {
   try {
+    await setLastIngestRun(); // so dashboard "only from last ingest" shows this run's alerts
     const summary = await ingestOnce({ mode: 'once' });
     res.json({ ok: true, ...summary });
   } catch (e) {
@@ -95,8 +96,10 @@ app.get('/v1/alerts', async (req, res) => {
     const sort_by = req.query.sort_by || undefined;
     const sort_dir = req.query.sort_dir || undefined;
     const actionable = req.query.actionable === 'true';
+    const since_last_ingest = req.query.since_last_ingest !== 'false'; // default true for testing: only show alerts from last "run ingest once"
     const rows = await getAlerts({
       active,
+      since_last_ingest,
       min_score,
       max_score,
       state,
@@ -186,6 +189,73 @@ app.get('/v1/states/:state/outbox', async (req, res) => {
     const limit = req.query.limit != null ? Math.min(100, parseInt(req.query.limit, 10) || 50) : 50;
     const rows = await getOutboxByState(state, limit);
     res.json({ outbox: rows });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// GET /v1/map/meta — default center, radar WMS config, time extent (optional states for center)
+app.get('/v1/map/meta', async (req, res) => {
+  try {
+    const states = req.query.states ? req.query.states.split(',').map((s) => s.trim()).filter(Boolean) : [];
+    let meta = await getMapMeta(states);
+    const baseUrl = (process.env.RADAR_WMS_BASE_URL || '').trim();
+    if (baseUrl && process.env.RADAR_TIME_ENABLED !== 'false') {
+      try {
+        const fetch = (await import('undici')).fetch;
+        const url = baseUrl.includes('?') ? baseUrl + '&request=GetCapabilities&SERVICE=WMS' : baseUrl + '?request=GetCapabilities&SERVICE=WMS';
+        const r = await fetch(url, { signal: AbortSignal.timeout(5000) });
+        const text = await r.text();
+        const timeSupported = /Dimension\s+[^>]*name\s*=\s*["']time["']/i.test(text) || /<Time>/i.test(text);
+        meta = { ...meta, radar_wms: { ...meta.radar_wms, time_supported: timeSupported } };
+      } catch (_) {
+        meta = { ...meta, radar_wms: { ...meta.radar_wms, time_supported: false } };
+      }
+    }
+    res.json(meta);
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// GET /v1/map/alerts — GeoJSON FeatureCollection of polygons (geom_present only)
+app.get('/v1/map/alerts', async (req, res) => {
+  try {
+    const states = req.query.states ? req.query.states.split(',').map((s) => s.trim()).filter(Boolean) : [];
+    const since_hours = req.query.since_hours != null ? parseInt(req.query.since_hours, 10) : 48;
+    const warnings_only = req.query.warnings_only === 'true';
+    const interesting_only = req.query.interesting_only === 'true';
+    const min_score = req.query.min_score != null ? parseInt(req.query.min_score, 10) : 0;
+    const since_last_ingest = req.query.since_last_ingest !== 'false';
+    let bbox;
+    if (req.query.bbox) {
+      const parts = req.query.bbox.split(',').map(Number);
+      if (parts.length >= 4 && parts.every((n) => !Number.isNaN(n))) bbox = parts.slice(0, 4);
+    }
+    const geojson = await getMapAlerts({ states, since_hours, warnings_only, interesting_only, min_score, since_last_ingest, bbox });
+    res.json(geojson);
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// GET /v1/map/zips — GeoJSON FeatureCollection of ZIP centroid points
+app.get('/v1/map/zips', async (req, res) => {
+  try {
+    const states = req.query.states ? req.query.states.split(',').map((s) => s.trim()).filter(Boolean) : [];
+    const since_hours = req.query.since_hours != null ? parseInt(req.query.since_hours, 10) : 48;
+    const warnings_only = req.query.warnings_only === 'true';
+    const interesting_only = req.query.interesting_only === 'true';
+    const min_score = req.query.min_score != null ? parseInt(req.query.min_score, 10) : 0;
+    const since_last_ingest = req.query.since_last_ingest !== 'false';
+    let bbox;
+    if (req.query.bbox) {
+      const parts = req.query.bbox.split(',').map(Number);
+      if (parts.length >= 4 && parts.every((n) => !Number.isNaN(n))) bbox = parts.slice(0, 4);
+    }
+    const prefer_polygons = req.query.prefer_polygons === 'true';
+    const geojson = await getMapZips({ states, since_hours, warnings_only, interesting_only, min_score, since_last_ingest, bbox, prefer_polygons });
+    res.json(geojson);
   } catch (e) {
     res.status(500).json({ error: e.message });
   }
