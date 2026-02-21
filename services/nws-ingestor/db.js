@@ -80,6 +80,27 @@ async function upsertAlerts(rows) {
   return { inserted_count, updated_count, resultById };
 }
 
+// Area in sq mi from GeoJSON geometry (WGS84). 2589988.11 = meters per sq mi (conversion for geography).
+const AREA_SQ_MILES_SQL = `
+  SELECT (ST_Area(ST_SetSRID(ST_GeomFromGeoJSON($1::text), 4326)::geography) / 2589988.11)::numeric AS area_sq_miles
+`;
+
+/**
+ * Get area in square miles for a GeoJSON geometry. Returns null if invalid or null.
+ * @param {object|null} geojsonGeometry - GeoJSON geometry
+ * @returns {Promise<number|null>}
+ */
+async function getAreaSqMiles(geojsonGeometry) {
+  if (geojsonGeometry == null || typeof geojsonGeometry !== 'object') return null;
+  try {
+    const { rows } = await pool.query(AREA_SQ_MILES_SQL, [JSON.stringify(geojsonGeometry)]);
+    const val = rows[0]?.area_sq_miles;
+    return val != null && !Number.isNaN(Number(val)) ? Number(val) : null;
+  } catch (_) {
+    return null;
+  }
+}
+
 // PostGIS: NWS GeoJSON (WGS84/4326) → ZCTA intersection. zcta5_raw.geom is SRID 4269 (NAD83); we transform
 // input to 4269 so both sides match and the GIST index on geom can be used. Parameterized ($1) only.
 const ZIPS_INTERSECT_SQL = `
@@ -177,9 +198,9 @@ async function insertUgcZips(ugc, zips) {
 const IMPACT_UPSERT_SQL = `
   INSERT INTO public.alert_impacted_zips (
     alert_id, event, headline, severity, sent, effective, expires, geom_present, zips,
-    impacted_states, zip_count
+    impacted_states, zip_count, alert_class, area_sq_miles, zip_density, geo_method, zip_inference_method
   )
-  VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
+  VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16)
   ON CONFLICT (alert_id) DO UPDATE SET
     zips = EXCLUDED.zips,
     expires = EXCLUDED.expires,
@@ -187,12 +208,17 @@ const IMPACT_UPSERT_SQL = `
     severity = EXCLUDED.severity,
     geom_present = EXCLUDED.geom_present,
     impacted_states = EXCLUDED.impacted_states,
-    zip_count = EXCLUDED.zip_count
+    zip_count = EXCLUDED.zip_count,
+    alert_class = EXCLUDED.alert_class,
+    area_sq_miles = EXCLUDED.area_sq_miles,
+    zip_density = EXCLUDED.zip_density,
+    geo_method = EXCLUDED.geo_method,
+    zip_inference_method = EXCLUDED.zip_inference_method
 `;
 
 /**
  * Upsert one row into alert_impacted_zips.
- * @param {object} row - { id, event, headline, severity, sent, effective, expires, geom_present, zips, impacted_states }
+ * @param {object} row - { id, event, headline, severity, sent, effective, expires, geom_present, zips, impacted_states, alert_class?, area_sq_miles?, zip_density?, geo_method?, zip_inference_method? }
  * @returns {Promise<'insert'|'update'>}
  */
 async function upsertAlertImpactedZipsRow(row) {
@@ -215,6 +241,11 @@ async function upsertAlertImpactedZipsRow(row) {
     zips,
     impacted_states,
     zip_count,
+    row.alert_class ?? 'other',
+    row.area_sq_miles ?? null,
+    row.zip_density ?? null,
+    row.geo_method ?? 'unknown',
+    row.zip_inference_method ?? 'none',
   ]);
   return existing.rows.length > 0 ? 'update' : 'insert';
 }
@@ -470,6 +501,273 @@ async function getAlertLsrSummaries(alertIds) {
   return rows || [];
 }
 
+/** Freeze event names for interesting_rare_freeze (must match thresholds.js). */
+const FREEZE_EVENT_NAMES = [
+  'Freeze Warning',
+  'Hard Freeze Warning',
+  'Freeze Watch',
+  'Frost Advisory',
+];
+
+/**
+ * Update all alert_impacted_zips with threshold flags and damage_score (set-based).
+ * @param {number} hailInches - INTERESTING_HAIL_INCHES
+ * @param {number} windMph - INTERESTING_WIND_MPH
+ * @param {string[]} freezeRareStates - FREEZE_RARE_STATES
+ * @param {string[]} freezeEventNames - Freeze event names
+ */
+async function updateAlertThresholdsAndScore(hailInches, windMph, freezeRareStates, freezeEventNames) {
+  const sql = `
+    UPDATE public.alert_impacted_zips p SET
+      interesting_hail = (p.hail_max_inches IS NOT NULL AND p.hail_max_inches >= $1),
+      interesting_wind = (p.wind_max_mph IS NOT NULL AND p.wind_max_mph >= $2),
+      interesting_rare_freeze = (p.event = ANY($3::text[]) AND p.impacted_states && $4::text[]),
+      interesting_any = (
+        (p.hail_max_inches IS NOT NULL AND p.hail_max_inches >= $1) OR
+        (p.wind_max_mph IS NOT NULL AND p.wind_max_mph >= $2) OR
+        (p.event = ANY($3::text[]) AND p.impacted_states && $4::text[])
+      ),
+      damage_score = LEAST(100, GREATEST(0,
+        (CASE WHEN p.event LIKE '% Warning' THEN 50 WHEN p.event LIKE '% Watch' THEN 10 ELSE 0 END) +
+        (CASE WHEN p.hail_max_inches IS NOT NULL AND p.hail_max_inches >= $1 THEN 40 ELSE 0 END) +
+        (CASE WHEN p.wind_max_mph IS NOT NULL AND p.wind_max_mph >= $2 THEN 30 ELSE 0 END) +
+        (CASE WHEN p.event = ANY($3::text[]) AND p.impacted_states && $4::text[] THEN 35 ELSE 0 END) +
+        (CASE WHEN COALESCE(p.tornado_count, 0) > 0 THEN 40 ELSE 0 END)
+      ))
+  `;
+  await pool.query(sql, [
+    hailInches,
+    windMph,
+    freezeEventNames || FREEZE_EVENT_NAMES,
+    freezeRareStates || [],
+  ]);
+}
+
+/**
+ * Generate stable event_key for outbox idempotency: alert_id + payload_version + hash of sorted zips.
+ * @param {string} alertId
+ * @param {number} payloadVersion
+ * @param {string[]} zips - sorted unique zips
+ */
+function buildEventKey(alertId, payloadVersion, zips) {
+  const arr = Array.isArray(zips) ? [...zips].sort() : [];
+  const zipHash = crypto.createHash('sha256').update(arr.join(',')).digest('hex').slice(0, 16);
+  return `${alertId}:v${payloadVersion}:${zipHash}`;
+}
+
+const OUTBOX_INSERT_SQL = `
+  INSERT INTO public.zip_delivery_outbox (status, destination, event_key, alert_id, payload_version, payload)
+  VALUES ($1, $2, $3, $4, $5, $6)
+  ON CONFLICT (event_key) DO UPDATE SET status = EXCLUDED.status, payload = EXCLUDED.payload
+  RETURNING id, created_at, status, event_key, alert_id
+`;
+
+/**
+ * Enqueue a delivery (or get existing by event_key). Idempotent by event_key.
+ * @param {object} params - { destination, alert_id, payload_version, payload }
+ * @param {string[]} zips - for event_key hash
+ * @returns {Promise<{ id: string, created_at: Date, status: string, event_key: string, alert_id: string }>}
+ */
+async function enqueueDelivery(params, zips) {
+  const eventKey = buildEventKey(params.alert_id, params.payload_version ?? 1, zips);
+  const { rows } = await pool.query(OUTBOX_INSERT_SQL, [
+    'queued',
+    params.destination,
+    eventKey,
+    params.alert_id,
+    params.payload_version ?? 1,
+    JSON.stringify(params.payload || {}),
+  ]);
+  return rows[0];
+}
+
+/**
+ * Get outbox rows by status.
+ * @param {string} [status] - queued|sent|failed|cancelled or omit for all
+ * @param {number} [limit]
+ */
+async function getOutbox(status, limit = 100) {
+  const sql = status
+    ? 'SELECT * FROM public.zip_delivery_outbox WHERE status = $1 ORDER BY created_at DESC LIMIT $2'
+    : 'SELECT * FROM public.zip_delivery_outbox ORDER BY created_at DESC LIMIT $1';
+  const params = status ? [status, limit] : [limit];
+  const { rows } = await pool.query(sql, params);
+  return rows;
+}
+
+/**
+ * Update outbox row status and attempt info.
+ */
+async function updateOutboxRow(id, updates) {
+  const sets = [];
+  const values = [];
+  let i = 1;
+  if (updates.status != null) { sets.push(`status = $${i++}`); values.push(updates.status); }
+  if (updates.attempt_count != null) { sets.push(`attempt_count = $${i++}`); values.push(updates.attempt_count); }
+  if (updates.last_error != null) { sets.push(`last_error = $${i++}`); values.push(updates.last_error); }
+  if (updates.last_attempt_at != null) { sets.push(`last_attempt_at = $${i++}`); values.push(updates.last_attempt_at); }
+  if (updates.remote_job_id != null) { sets.push(`remote_job_id = $${i++}`); values.push(updates.remote_job_id); }
+  if (sets.length === 0) return;
+  values.push(id);
+  await pool.query(
+    `UPDATE public.zip_delivery_outbox SET ${sets.join(', ')} WHERE id = $${i}`,
+    values
+  );
+}
+
+/**
+ * Set outbox row to cancelled.
+ */
+async function cancelOutboxRow(id) {
+  await pool.query(
+    "UPDATE public.zip_delivery_outbox SET status = 'cancelled' WHERE id = $1",
+    [id]
+  );
+}
+
+/**
+ * Get one alert by alert_id (from alert_impacted_zips).
+ */
+async function getAlertById(alertId) {
+  const { rows } = await pool.query(
+    'SELECT * FROM public.alert_impacted_zips WHERE alert_id = $1',
+    [alertId]
+  );
+  return rows[0] || null;
+}
+
+/**
+ * List alerts with optional filters. One row per alert_id. All from alert_impacted_zips.
+ * @param {object} filters - active?, state?, class? (warning|watch|advisory|statement|other), interesting?, geom_present?, lsr_present?, min_score?, min_zip_count?, max_zip_count?, max_area_sq_miles?, sort? (score_desc|expires_soon|newest|zip_density_desc)
+ */
+async function getAlerts(filters = {}) {
+  const conditions = [];
+  const params = [];
+  let i = 1;
+  if (filters.active === true) {
+    conditions.push('(expires IS NULL OR expires > now())');
+  }
+  if (filters.state && String(filters.state).trim()) {
+    conditions.push(`impacted_states @> ARRAY[$${i++}]::text[]`);
+    params.push(String(filters.state).trim().toUpperCase());
+  }
+  const classVal = filters.class && String(filters.class).toLowerCase();
+  if (['warning', 'watch', 'advisory', 'statement', 'other'].includes(classVal)) {
+    conditions.push(`COALESCE(alert_class, 'other') = $${i++}`);
+    params.push(classVal);
+  }
+  if (filters.min_score != null && !Number.isNaN(Number(filters.min_score))) {
+    conditions.push(`COALESCE(damage_score, 0) >= $${i++}`);
+    params.push(Number(filters.min_score));
+  }
+  if (filters.interesting === true) {
+    conditions.push('interesting_any = true');
+  }
+  if (filters.interesting === false) {
+    conditions.push('(interesting_any = false OR interesting_any IS NULL)');
+  }
+  if (filters.actionable === true) {
+    conditions.push("(COALESCE(alert_class, 'other') = 'warning' AND (interesting_any = true OR COALESCE(damage_score, 0) >= 60))");
+  }
+  if (filters.geom_present === true) {
+    conditions.push('geom_present = true');
+  }
+  if (filters.geom_present === false) {
+    conditions.push('geom_present = false');
+  }
+  if (filters.lsr_present === true) {
+    conditions.push('COALESCE(lsr_match_count, 0) > 0');
+  }
+  if (filters.lsr_present === false) {
+    conditions.push('(lsr_match_count IS NULL OR lsr_match_count = 0)');
+  }
+  if (filters.min_zip_count != null && !Number.isNaN(Number(filters.min_zip_count))) {
+    conditions.push(`COALESCE(zip_count, 0) >= $${i++}`);
+    params.push(Number(filters.min_zip_count));
+  }
+  if (filters.max_zip_count != null && !Number.isNaN(Number(filters.max_zip_count))) {
+    conditions.push(`COALESCE(zip_count, 0) <= $${i++}`);
+    params.push(Number(filters.max_zip_count));
+  }
+  if (filters.max_area_sq_miles != null && !Number.isNaN(Number(filters.max_area_sq_miles))) {
+    conditions.push(`(area_sq_miles IS NULL OR area_sq_miles <= $${i++})`);
+    params.push(Number(filters.max_area_sq_miles));
+  }
+  const where = conditions.length ? ' WHERE ' + conditions.join(' AND ') : '';
+  const sort = filters.sort && String(filters.sort).toLowerCase();
+  let orderBy = 'expires ASC NULLS LAST';
+  if (sort === 'score_desc') {
+    orderBy = 'COALESCE(damage_score, 0) DESC, expires ASC NULLS LAST';
+  } else if (sort === 'expires_soon') {
+    orderBy = 'expires ASC NULLS LAST';
+  } else if (sort === 'newest') {
+    orderBy = 'last_seen_at DESC NULLS LAST, expires ASC NULLS LAST';
+  } else if (sort === 'zip_density_desc') {
+    orderBy = 'zip_density DESC NULLS LAST, COALESCE(damage_score, 0) DESC';
+  }
+  const sql = `SELECT * FROM public.alert_impacted_zips ${where} ORDER BY ${orderBy} LIMIT 500`;
+  const { rows } = await pool.query(sql, params);
+  return rows;
+}
+
+/**
+ * List alerts grouped by state: one row per state with events and aggregated ZIP/LSR/score.
+ * Uses same filters as getAlerts. Each alert is expanded by its impacted_states.
+ * @param {object} filters - same as getAlerts
+ * @returns {Promise<{ state: string, events: object[], zip_count_sum: number, lsr_sum: number, max_score: number, badges: string[] }[]>}
+ */
+async function getAlertsByState(filters = {}) {
+  const alerts = await getAlerts(filters);
+  const byState = new Map();
+  for (const a of alerts) {
+    const states = Array.isArray(a.impacted_states) ? a.impacted_states : [];
+    for (const st of states) {
+      if (!st || typeof st !== 'string') continue;
+      const key = String(st).toUpperCase();
+      if (!byState.has(key)) {
+        byState.set(key, {
+          state: key,
+          events: [],
+          zip_count_sum: 0,
+          lsr_sum: 0,
+          max_score: 0,
+          badges: new Set(),
+        });
+      }
+      const row = byState.get(key);
+      row.events.push({
+        alert_id: a.alert_id,
+        event: a.event,
+        severity: a.severity,
+        zip_count: a.zip_count ?? 0,
+        lsr_match_count: a.lsr_match_count ?? 0,
+        damage_score: a.damage_score ?? 0,
+        interesting_hail: a.interesting_hail,
+        interesting_wind: a.interesting_wind,
+        interesting_rare_freeze: a.interesting_rare_freeze,
+      });
+      row.zip_count_sum += a.zip_count ?? 0;
+      row.lsr_sum += a.lsr_match_count ?? 0;
+      const score = a.damage_score ?? 0;
+      if (score > row.max_score) row.max_score = score;
+      if (a.interesting_hail) row.badges.add('hail');
+      if (a.interesting_wind) row.badges.add('wind');
+      if (a.interesting_rare_freeze) row.badges.add('freeze');
+    }
+  }
+  return Array.from(byState.values())
+    .map((r) => ({ ...r, badges: Array.from(r.badges) }))
+    .sort((a, b) => a.state.localeCompare(b.state));
+}
+
+/**
+ * Get one outbox row by id.
+ */
+async function getOutboxById(id) {
+  const { rows } = await pool.query('SELECT * FROM public.zip_delivery_outbox WHERE id = $1', [id]);
+  return rows[0] || null;
+}
+
 const POLL_SNAPSHOT_INSERT_SQL = `
   INSERT INTO public.nws_poll_snapshots (
     polled_at, duration_ms, fetched_count, actionable_count, geom_present_count,
@@ -511,6 +809,7 @@ async function closePool() {
 module.exports = {
   pool,
   upsertAlerts,
+  getAreaSqMiles,
   getZipsByGeometry,
   getZipsByPoint,
   getZipsByUgc,
@@ -521,7 +820,17 @@ module.exports = {
   upsertLsrObservations,
   runSetBasedLsrMatch,
   updateAlertLsrSummary,
+  updateAlertThresholdsAndScore,
   getAlertLsrSummaries,
+  buildEventKey,
+  enqueueDelivery,
+  getOutbox,
+  getOutboxById,
+  updateOutboxRow,
+  cancelOutboxRow,
+  getAlertById,
+  getAlerts,
+  getAlertsByState,
   lsrPointInAlertGeometry,
   LSR_POINT_IN_GEOM_SQL,
   insertLsrMatch,

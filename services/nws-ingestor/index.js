@@ -3,7 +3,9 @@ const config = require('./config');
 const { fetchActiveAlerts } = require('./nwsClient');
 const { normalizeFeature } = require('./normalize');
 const { classifyAlert, isActionable } = require('./activation');
-const { upsertAlerts, getZipsByGeometry, getZipsByPoint, getZipsByUgc, insertUgcZips, upsertAlertImpactedZips, insertPollSnapshot, getAlertLsrSummaries, closePool } = require('./db');
+const { upsertAlerts, getAreaSqMiles, getZipsByGeometry, getZipsByPoint, getZipsByUgc, insertUgcZips, upsertAlertImpactedZips, insertPollSnapshot, getAlertLsrSummaries, updateAlertThresholdsAndScore, closePool } = require('./db');
+const { deriveAlertClass, deriveGeoMethod, deriveZipInferenceMethod, computeZipDensity } = require('./alertClass');
+const { FREEZE_EVENT_NAMES } = require('./thresholds');
 const { runLsrPipeline } = require('./lsrEnrich');
 const { fetchZoneGeometry } = require('./zoneClient');
 const log = require('./logger');
@@ -201,6 +203,15 @@ async function ingestOnce(opts = {}) {
           const pt = await geocodeCityState(loc.city, loc.state);
           if (pt) zips = await getZipsByPoint(pt.lon, pt.lat);
         }
+        const zip_count = zips.length;
+        let area_sq_miles = null;
+        if (geom_present && row.geometry_json) {
+          area_sq_miles = await getAreaSqMiles(row.geometry_json);
+        }
+        const alert_class = deriveAlertClass(row.event);
+        const geo_method = deriveGeoMethod(geom_present, ugcs);
+        const zip_inference_method = deriveZipInferenceMethod(geom_present, zip_count);
+        const zip_density = computeZipDensity(zip_count, area_sq_miles);
         return {
           id: row.id,
           event: row.event,
@@ -212,6 +223,11 @@ async function ingestOnce(opts = {}) {
           geom_present,
           zips,
           impacted_states: impacted_states.length ? impacted_states : [],
+          alert_class,
+          area_sq_miles,
+          zip_density,
+          geo_method,
+          zip_inference_method,
         };
       })
     );
@@ -279,6 +295,18 @@ async function ingestOnce(opts = {}) {
     } catch (lsrErr) {
       errorsCount++;
       log.errorMsg('LSR pipeline failed: ' + (lsrErr && lsrErr.message));
+    }
+
+    try {
+      await updateAlertThresholdsAndScore(
+        config.interestingHailInches,
+        config.interestingWindMph,
+        config.freezeRareStates,
+        FREEZE_EVENT_NAMES
+      );
+    } catch (thrErr) {
+      errorsCount++;
+      log.errorMsg('Thresholds/score update failed: ' + (thrErr && thrErr.message));
     }
 
     const duration_ms = Date.now() - start;
@@ -393,18 +421,20 @@ function startPolling() {
   process.on('SIGTERM', shutdown);
 }
 
-// CLI: node index.js [once|poll]
-const cliMode = process.argv[2] || 'once';
-if (cliMode === 'poll') {
-  startPolling();
-} else {
-  ingestOnce({ mode: 'once' })
-    .then(() => closePool())
-    .then(() => process.exit(0))
-    .catch((err) => {
-      log.fatal(err && err.message);
-      closePool().finally(() => process.exit(1));
-    });
-}
-
 module.exports = { ingestOnce, startPolling };
+
+// CLI: node index.js [once|poll] (only when run directly, not when required by API)
+if (require.main === module) {
+  const cliMode = process.argv[2] || 'once';
+  if (cliMode === 'poll') {
+    startPolling();
+  } else {
+    ingestOnce({ mode: 'once' })
+      .then(() => closePool())
+      .then(() => process.exit(0))
+      .catch((err) => {
+        log.fatal(err && err.message);
+        closePool().finally(() => process.exit(1));
+      });
+  }
+}

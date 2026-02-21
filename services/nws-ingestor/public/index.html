@@ -1,0 +1,101 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>AI-STORMS Operator</title>
+  <style>
+    * { box-sizing: border-box; }
+    body { font-family: system-ui, sans-serif; margin: 0; padding: 1rem; background: #0f0f12; color: #e4e4e7; }
+    h1 { font-size: 1.25rem; margin: 0 0 1rem 0; }
+    nav { margin-bottom: 1rem; }
+    nav a { color: #a1a1aa; margin-right: 1rem; text-decoration: none; }
+    nav a:hover, nav a.active { color: #fff; }
+    .event-link { color: #60a5fa; text-decoration: none; }
+    .event-link:hover { text-decoration: underline; }
+    .events-cell { max-width: 280px; }
+    section { display: none; }
+    section.active { display: block; }
+    table { width: 100%; border-collapse: collapse; font-size: 0.875rem; }
+    th, td { padding: 0.5rem; text-align: left; border-bottom: 1px solid #27272a; }
+    th { color: #71717a; font-weight: 600; }
+    tr:hover { background: #18181b; }
+    button, .btn { background: #3f3f46; color: #fff; border: none; padding: 0.5rem 0.75rem; border-radius: 6px; cursor: pointer; font-size: 0.875rem; }
+    button:hover, .btn:hover { background: #52525b; }
+    button.primary { background: #2563eb; }
+    button.primary:hover { background: #3b82f6; }
+    input, select { background: #27272a; border: 1px solid #3f3f46; color: #e4e4e7; padding: 0.5rem; border-radius: 6px; margin-right: 0.5rem; }
+    .badge { display: inline-block; padding: 0.15rem 0.5rem; border-radius: 4px; font-size: 0.75rem; margin-right: 0.25rem; }
+    .badge.hail { background: #fef3c7; color: #92400e; }
+    .badge.wind { background: #dbeafe; color: #1e40af; }
+    .badge.freeze { background: #e0e7ff; color: #3730a3; }
+    .badge.class { background: #3f3f46; color: #a1a1aa; font-size: 0.7rem; }
+    .badge.geom-missing { background: #7f1d1d; color: #fecaca; }
+    .tabs { margin-bottom: 0.75rem; }
+    .tabs button { margin-right: 0.5rem; padding: 0.4rem 0.75rem; border-radius: 6px; background: #27272a; color: #a1a1aa; border: 1px solid #3f3f46; cursor: pointer; }
+    .tabs button.active { background: #3f3f46; color: #fff; }
+    .tabs button:hover { background: #3f3f46; color: #e4e4e7; }
+    .row-actions button { margin-right: 0.25rem; padding: 0.25rem 0.5rem; font-size: 0.8rem; }
+    .copy-block { font-family: monospace; font-size: 0.75rem; white-space: pre-wrap; background: #18181b; padding: 1rem; border-radius: 6px; margin: 1rem 0; max-height: 300px; overflow: auto; }
+    .alert { padding: 0.75rem; border-radius: 6px; margin: 0.5rem 0; }
+    .alert.success { background: #14532d; color: #bbf7d0; }
+    .alert.error { background: #7f1d1d; color: #fecaca; }
+  </style>
+</head>
+<body>
+  <h1>AI-STORMS Operator</h1>
+  <div id="login-section" style="display:none;">
+    <p>Sign in to continue.</p>
+    <input type="email" id="login-email" placeholder="Email" />
+    <input type="password" id="login-password" placeholder="Password" />
+    <button id="login-btn" class="primary">Sign in</button>
+    <span id="login-error" class="alert error" style="display:none; margin-left: 0.5rem;"></span>
+  </div>
+  <nav id="nav" style="display:none;">
+    <a href="#" data-page="dashboard" class="active">Dashboard</a>
+    <a href="#" data-page="outbox">Outbox</a>
+    <button id="logout-btn">Logout</button>
+  </nav>
+
+  <section id="dashboard" class="active">
+    <p>
+      <button id="run-once-btn" class="primary" type="button">Run ingest once</button>
+      <span id="run-once-status"></span>
+    </p>
+    <div class="tabs">
+      <button type="button" id="tab-actionable" class="active">Actionable Now</button>
+      <button type="button" id="tab-all">All Alerts</button>
+    </div>
+    <p>Filters: <input type="text" id="filter-state" placeholder="State (e.g. TX)" />
+    <select id="filter-class"><option value="">All</option><option value="warning">Warning</option><option value="watch">Watch</option><option value="advisory">Advisory</option><option value="statement">Statement</option><option value="other">Other</option></select>
+    <label><input type="checkbox" id="filter-active" /> Active only</label>
+    <label><input type="checkbox" id="filter-interesting" /> Interesting only</label>
+    <input type="number" id="filter-min-score" placeholder="Min score" style="width:80px" />
+    <button id="filter-apply">Apply</button></p>
+    <table id="alerts-table">
+      <thead><tr><th>Event</th><th>States</th><th>ZIPs</th><th>Geom</th><th>Area</th><th>Density</th><th>LSR</th><th>Score</th><th>Badges</th><th>Actions</th></tr></thead>
+      <tbody></tbody>
+    </table>
+  </section>
+
+  <section id="detail">
+    <p><a href="#" id="detail-back">← Back to Dashboard</a></p>
+    <div id="detail-content"></div>
+    <p>
+      <button id="copy-zips-lsr-btn" class="primary">Copy ZIPs + LSR Summary</button>
+      <a id="download-csv-btn" class="btn" href="#" download="zips.csv">Download CSV</a>
+      <button id="queue-delivery-btn">Queue delivery</button>
+    </p>
+    <div id="detail-message"></div>
+  </section>
+
+  <section id="outbox">
+    <table id="outbox-table">
+      <thead><tr><th>Created</th><th>Alert ID</th><th>Destination</th><th>Status</th><th>Event key</th><th></th></tr></thead>
+      <tbody></tbody>
+    </table>
+  </section>
+
+  <script src="app.js"></script>
+</body>
+</html>

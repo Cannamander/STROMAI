@@ -67,4 +67,12 @@ module.exports = {
   /** Delay (ms) between NWS zone geometry fetches when inferring ZIPs. Lower = faster; 0 = no delay. Default 50. */
   inferZipDelayMs: process.env.INFER_ZIP_DELAY_MS === '0' ? 0 : Math.max(0, parseInt(process.env.INFER_ZIP_DELAY_MS, 10) || 50),
   inferZipGeocode: process.env.INFER_ZIP_GEOCODE === 'true' || process.env.INFER_ZIP_GEOCODE === '1',
+  /** Thresholds for interesting flags (configurable via env). */
+  interestingHailInches: parseFloat(process.env.INTERESTING_HAIL_INCHES) || 1.25,
+  interestingWindMph: Math.max(0, parseInt(process.env.INTERESTING_WIND_MPH, 10) || 70),
+  /** States where freeze events are "rare" and get interesting_rare_freeze. */
+  freezeRareStates: (process.env.FREEZE_RARE_STATES || 'TX,LA,MS,AL,FL,GA,SC')
+    .split(',')
+    .map((s) => s.trim().toUpperCase())
+    .filter(Boolean),
 };

@@ -22,6 +22,39 @@ Polls NWS active alerts, filters to actionable warnings (and optionally watches)
 - **NWS_STORE_SNAPSHOTS** – Set `false` or `0` to disable writing a row to `nws_poll_snapshots` each run (default: store). Use when running persistently for map overlay / time-window logs / alerts.
 - **INFER_ZIP** – Set `false` or `0` to disable inferring ZIPs when the alert has no geometry (default: on). When on, we use **zone (UGC)** and optionally **city+state** to resolve ZIPs.
 - **INFER_ZIP_GEOCODE** – Set `true` or `1` to geocode **city + state** to a point and resolve the containing ZCTA when there is no geometry and no UGC match. Uses Nominatim (no API key); respect rate limits.
+- **INTERESTING_HAIL_INCHES** – Hail threshold for interesting_hail flag (default 1.25)
+- **INTERESTING_WIND_MPH** – Wind threshold for interesting_wind flag (default 70)
+- **FREEZE_RARE_STATES** – Comma-separated state codes for interesting_rare_freeze (default TX,LA,MS,AL,FL,GA,SC)
+- **API_PORT** – Port for HTTP API (default 3000). **SUPABASE_URL** and **SUPABASE_ANON_KEY** enable JWT auth.
+- **WORKER_POLL_MS** – Delivery worker poll interval (default 5000)
+
+## API and operator UI
+
+- **npm run api** – Starts HTTP API and serves operator UI from `services/nws-ingestor/public/`. Endpoints: `GET /v1/alerts`, `GET /v1/alerts/:id`, `GET /v1/alerts/:id/zips.csv`, `GET /v1/alerts/:id/payload`, `POST /v1/deliveries`, `GET /v1/outbox`, `POST /v1/outbox/:id/retry`, `POST /v1/outbox/:id/cancel`. Without SUPABASE_URL, requests are unauthenticated (dev).
+- **npm run worker** – Polls `zip_delivery_outbox` for status=queued and sends via mock adapter (remote_job_id=mock). Set **WORKER_POLL_MS** to tune.
+
+### Operator UI – how to use
+
+1. **Start the API** (from repo root): `npm run api`. Ensure **DATABASE_URL** is set in `.env` so the API can read alerts. Have at least one ingest run (`npm run nws:once`) so there is data to show.
+
+2. **Open the UI** in a browser: **http://localhost:3000** (or `http://localhost:API_PORT` if you set **API_PORT**).
+
+3. **Dashboard** – The first page lists alerts in a table (event, severity, states, ZIP count, LSR count, damage score, badges like HAIL 1.25+, WIND 70+, RARE FREEZE). **Run ingest once** runs the full NWS ingest (fetch alerts, derive ZIPs, LSR pipeline, thresholds) and then refreshes the table. Use the filters:
+   - **State** – e.g. `TX` to show only alerts affecting that state.
+   - **Class** – All / Warning / Watch.
+   - **Active only** – Only alerts that haven’t expired.
+   - **Interesting only** – Only alerts with at least one interesting flag (hail, wind, or rare freeze).
+   - **Min score** – Minimum damage score (0–100).  
+   Click **Apply** to refresh the list. Click **Detail** on a row to open the alert detail page.
+
+4. **Alert detail** – Shows the full alert block (metadata, LSR summary, ZIP count, interesting flags, damage score). Use:
+   - **Copy ZIPs + LSR Summary** – Copies a formatted block to the clipboard (alert_id, event, window, states, zips_count, zips_sample, lsr stats, interesting flags, damage_score). If there are ≤250 ZIPs, the block includes **ALL_ZIPS**; otherwise it tells you to export CSV.
+   - **Download CSV** – Downloads a CSV of impacted ZIPs for that alert.
+   - **Queue delivery** – Creates an outbox row (destination `property_enrichment_v1`) so the worker can send it. You’ll see a success message with the event key.
+
+5. **Outbox** – Open the **Outbox** tab to see queued, sent, and failed deliveries. Use **Retry** to re-queue a failed row and **Cancel** to cancel a queued one. Run **npm run worker** in a separate terminal so queued rows are actually sent (mock adapter).
+
+6. **Auth (optional)** – If you set **SUPABASE_URL** and **SUPABASE_ANON_KEY**, the UI will show a sign-in form and require a valid Supabase user. Install `@supabase/supabase-js` and load it in the page (e.g. script tag) for login to work. Without these env vars, the UI runs unauthenticated (suitable for local/dev).
 
 ## Logging
 
@@ -73,6 +106,8 @@ psql "$DATABASE_URL" -f services/nws-ingestor/migrations/004_ugc_zips.sql
 psql "$DATABASE_URL" -f services/nws-ingestor/migrations/005_alert_impacted_states_lsr_summary.sql
 psql "$DATABASE_URL" -f services/nws-ingestor/migrations/006_nws_lsr_observations.sql
 psql "$DATABASE_URL" -f services/nws-ingestor/migrations/007_nws_alert_lsr_matches.sql
+psql "$DATABASE_URL" -f services/nws-ingestor/migrations/008_alert_thresholds_delivery_score.sql
+psql "$DATABASE_URL" -f services/nws-ingestor/migrations/009_zip_delivery_outbox.sql
 ```
 Then populate **ugc_zips** (UGC code → ZIP list) if you want ZIP inference when alerts have no geometry; see “Inferring ZIPs when NWS sends no geometry” above.
 

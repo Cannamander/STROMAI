@@ -1,7 +1,7 @@
 'use strict';
 const { describe, it } = require('node:test');
 const assert = require('node:assert');
-const { getZipsQueryParams, ZIPS_INTERSECT_SQL, LSR_POINT_IN_GEOM_SQL } = require('./db');
+const { getZipsQueryParams, ZIPS_INTERSECT_SQL, LSR_POINT_IN_GEOM_SQL, buildEventKey } = require('./db');
 
 describe('getZipsByGeometry / PostGIS params', () => {
   it('uses parameterized SQL ($1) only, no string concatenation', () => {
@@ -50,5 +50,25 @@ describe('LSR point-in-polygon SQL', () => {
     assert.ok(LSR_POINT_IN_GEOM_SQL.includes('ST_MakePoint($2'));
     const params = LSR_POINT_IN_GEOM_SQL.match(/\$\d+/g) || [];
     assert.strictEqual(params.length, 3);
+  });
+});
+
+describe('event_key idempotency', () => {
+  it('buildEventKey is stable for same alert_id + version + zips', () => {
+    const k1 = buildEventKey('alert-1', 1, ['77001', '77002']);
+    const k2 = buildEventKey('alert-1', 1, ['77001', '77002']);
+    assert.strictEqual(k1, k2);
+  });
+  it('buildEventKey differs for different zips', () => {
+    const k1 = buildEventKey('alert-1', 1, ['77001', '77002']);
+    const k2 = buildEventKey('alert-1', 1, ['77002', '77001']);
+    assert.strictEqual(k1, k2);
+  });
+  it('buildEventKey differs for different alert_id or version', () => {
+    const k1 = buildEventKey('alert-1', 1, ['77001']);
+    const k2 = buildEventKey('alert-2', 1, ['77001']);
+    const k3 = buildEventKey('alert-1', 2, ['77001']);
+    assert.notStrictEqual(k1, k2);
+    assert.notStrictEqual(k1, k3);
   });
 });

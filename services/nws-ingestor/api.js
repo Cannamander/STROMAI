@@ -1,0 +1,225 @@
+#!/usr/bin/env node
+'use strict';
+/**
+ * HTTP API for alerts, deliveries, and outbox. Start with: npm run api
+ * Auth: Supabase Auth (Bearer token). Set SUPABASE_URL + SUPABASE_ANON_KEY to verify JWT.
+ */
+require('dotenv').config();
+const express = require('express');
+const { getAlerts, getAlertById, enqueueDelivery, getOutbox, getOutboxById, updateOutboxRow, cancelOutboxRow } = require('./db');
+const { buildDeliveryPayload } = require('./payloadBuilder');
+const { ingestOnce } = require('./index');
+
+const path = require('path');
+const app = express();
+const PORT = process.env.API_PORT || 3000;
+
+app.use(express.json());
+
+// Operator UI static files (optional)
+const publicDir = path.join(__dirname, 'public');
+try {
+  const fs = require('fs');
+  if (fs.existsSync(publicDir)) app.use(express.static(publicDir));
+} catch (_) {}
+
+// Frontend config (Supabase URL/anon key for auth)
+app.get('/config.json', (req, res) => {
+  res.json({
+    supabaseUrl: process.env.SUPABASE_URL || '',
+    supabaseAnonKey: process.env.SUPABASE_ANON_KEY || '',
+    apiBase: '',
+  });
+});
+
+// Optional auth: if SUPABASE_URL is set, require valid Bearer token; else allow unauthenticated (dev).
+async function authMiddleware(req, res, next) {
+  const auth = req.headers.authorization;
+  if (!process.env.SUPABASE_URL || !process.env.SUPABASE_ANON_KEY) {
+    return next();
+  }
+  if (!auth || !auth.startsWith('Bearer ')) {
+    return res.status(401).json({ error: 'Missing or invalid Authorization header' });
+  }
+  const token = auth.slice(7);
+  try {
+    let createClient;
+    try {
+      createClient = require('@supabase/supabase-js').createClient;
+    } catch (_) {
+      return res.status(501).json({ error: 'Supabase not installed; set SUPABASE_URL only when @supabase/supabase-js is installed' });
+    }
+    const supabase = createClient(process.env.SUPABASE_URL, process.env.SUPABASE_ANON_KEY);
+    const { data: { user }, error } = await supabase.auth.getUser(token);
+    if (error || !user) return res.status(401).json({ error: 'Invalid token' });
+    req.user = user;
+    next();
+  } catch (e) {
+    return res.status(401).json({ error: 'Auth failed' });
+  }
+}
+
+app.use(authMiddleware);
+
+// POST /v1/ingest/once – run NWS ingest once (fetch all alerts, derive ZIPs, LSR pipeline, thresholds)
+app.post('/v1/ingest/once', async (req, res) => {
+  try {
+    const summary = await ingestOnce({ mode: 'once' });
+    res.json({ ok: true, ...summary });
+  } catch (e) {
+    res.status(500).json({ ok: false, error: e.message });
+  }
+});
+
+// GET /v1/alerts — one row per alert_id. Filters: state, class, interesting, geom_present, lsr_present, min_score, min_zip_count, max_zip_count, max_area_sq_miles. Sort: score_desc|expires_soon|newest|zip_density_desc
+app.get('/v1/alerts', async (req, res) => {
+  try {
+    const active = req.query.active === 'true';
+    const min_score = req.query.min_score != null ? Number(req.query.min_score) : undefined;
+    const state = req.query.state || undefined;
+    const interesting = req.query.interesting;
+    const class_ = req.query.class;
+    const geom_present = req.query.geom_present;
+    const lsr_present = req.query.lsr_present;
+    const min_zip_count = req.query.min_zip_count != null ? Number(req.query.min_zip_count) : undefined;
+    const max_zip_count = req.query.max_zip_count != null ? Number(req.query.max_zip_count) : undefined;
+    const max_area_sq_miles = req.query.max_area_sq_miles != null ? Number(req.query.max_area_sq_miles) : undefined;
+    const sort = req.query.sort;
+    const actionable = req.query.actionable === 'true';
+    const rows = await getAlerts({
+      active,
+      min_score,
+      state,
+      interesting: interesting === 'true' ? true : interesting === 'false' ? false : undefined,
+      actionable,
+      class: class_,
+      geom_present: geom_present === 'true' ? true : geom_present === 'false' ? false : undefined,
+      lsr_present: lsr_present === 'true' ? true : lsr_present === 'false' ? false : undefined,
+      min_zip_count,
+      max_zip_count,
+      max_area_sq_miles,
+      sort,
+    });
+    res.json({ alerts: rows });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// GET /v1/alerts/:alert_id
+app.get('/v1/alerts/:alert_id', async (req, res) => {
+  try {
+    const alert = await getAlertById(req.params.alert_id);
+    if (!alert) return res.status(404).json({ error: 'Alert not found' });
+    res.json(alert);
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// GET /v1/alerts/:alert_id/zips.csv
+app.get('/v1/alerts/:alert_id/zips.csv', async (req, res) => {
+  try {
+    const alert = await getAlertById(req.params.alert_id);
+    if (!alert) return res.status(404).json({ error: 'Alert not found' });
+    const zips = alert.zips || [];
+    res.setHeader('Content-Type', 'text/csv');
+    res.setHeader('Content-Disposition', `attachment; filename="alert-${req.params.alert_id}-zips.csv"`);
+    res.send('zip\n' + zips.join('\n'));
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// GET /v1/alerts/:alert_id/payload?destination=property_enrichment_v1
+app.get('/v1/alerts/:alert_id/payload', async (req, res) => {
+  try {
+    const alert = await getAlertById(req.params.alert_id);
+    if (!alert) return res.status(404).json({ error: 'Alert not found' });
+    const version = parseInt(req.query.payload_version, 10) || 1;
+    const payload = buildDeliveryPayload(alert, version);
+    res.json({ destination: req.query.destination || 'default', payload_version: version, payload });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// POST /v1/deliveries { alert_id, destination, payload_version=1, mode: "dry_run"|"queue"|"send_now" }
+app.post('/v1/deliveries', async (req, res) => {
+  try {
+    const { alert_id, destination, payload_version = 1, mode = 'queue' } = req.body || {};
+    if (!alert_id || !destination) return res.status(400).json({ error: 'alert_id and destination required' });
+    const alert = await getAlertById(alert_id);
+    if (!alert) return res.status(404).json({ error: 'Alert not found' });
+    const payload = buildDeliveryPayload(alert, payload_version);
+    const event_key = payload.event_key;
+
+    if (mode === 'dry_run') {
+      return res.json({ mode: 'dry_run', event_key, payload });
+    }
+
+    if (mode === 'queue') {
+      const row = await enqueueDelivery(
+        { destination, alert_id, payload_version, payload },
+        alert.zips || []
+      );
+      return res.status(201).json({ mode: 'queue', event_key, id: row.id, status: row.status });
+    }
+
+    if (mode === 'send_now') {
+      const row = await enqueueDelivery(
+        { destination, alert_id, payload_version, payload },
+        alert.zips || []
+      );
+      // Worker would pick it up; for sync "send_now" we could call the adapter here. Spec says worker does send. So we just queue and return.
+      return res.status(201).json({ mode: 'send_now', event_key, id: row.id, status: row.status });
+    }
+
+    return res.status(400).json({ error: 'Invalid mode' });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// GET /v1/outbox?status=queued|failed|sent
+app.get('/v1/outbox', async (req, res) => {
+  try {
+    const status = req.query.status || undefined;
+    const limit = Math.min(100, parseInt(req.query.limit, 10) || 50);
+    const rows = await getOutbox(status, limit);
+    res.json({ outbox: rows });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// POST /v1/outbox/:id/retry
+app.post('/v1/outbox/:id/retry', async (req, res) => {
+  try {
+    const row = await getOutboxById(req.params.id);
+    if (!row) return res.status(404).json({ error: 'Outbox row not found' });
+    if (row.status === 'sent') return res.status(400).json({ error: 'Already sent' });
+    await updateOutboxRow(row.id, { status: 'queued' });
+    const updated = await getOutboxById(req.params.id);
+    res.json(updated);
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// POST /v1/outbox/:id/cancel
+app.post('/v1/outbox/:id/cancel', async (req, res) => {
+  try {
+    const row = await getOutboxById(req.params.id);
+    if (!row) return res.status(404).json({ error: 'Outbox row not found' });
+    await cancelOutboxRow(row.id);
+    const updated = await getOutboxById(req.params.id);
+    res.json(updated);
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+app.listen(PORT, () => {
+  console.log('AI-STORMS API listening on port', PORT);
+});
