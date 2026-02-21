@@ -665,6 +665,10 @@ async function getAlerts(filters = {}) {
     conditions.push(`COALESCE(damage_score, 0) >= $${i++}`);
     params.push(Number(filters.min_score));
   }
+  if (filters.max_score != null && !Number.isNaN(Number(filters.max_score))) {
+    conditions.push(`COALESCE(damage_score, 0) <= $${i++}`);
+    params.push(Number(filters.max_score));
+  }
   if (filters.interesting === true) {
     conditions.push('interesting_any = true');
   }
@@ -699,20 +703,53 @@ async function getAlerts(filters = {}) {
     params.push(Number(filters.max_area_sq_miles));
   }
   const where = conditions.length ? ' WHERE ' + conditions.join(' AND ') : '';
-  const sort = filters.sort && String(filters.sort).toLowerCase();
-  let orderBy = 'expires ASC NULLS LAST';
-  if (sort === 'score_desc') {
-    orderBy = 'COALESCE(damage_score, 0) DESC, expires ASC NULLS LAST';
-  } else if (sort === 'expires_soon') {
-    orderBy = 'expires ASC NULLS LAST';
-  } else if (sort === 'newest') {
-    orderBy = 'last_seen_at DESC NULLS LAST, expires ASC NULLS LAST';
-  } else if (sort === 'zip_density_desc') {
-    orderBy = 'zip_density DESC NULLS LAST, COALESCE(damage_score, 0) DESC';
-  }
+  const orderBy = buildAlertsOrderBy(filters);
   const sql = `SELECT * FROM public.alert_impacted_zips ${where} ORDER BY ${orderBy} LIMIT 500`;
   const { rows } = await pool.query(sql, params);
   return rows;
+}
+
+/** Whitelist for column sort; maps to safe SQL expression. */
+const SORT_COLUMNS = new Set([
+  'event', 'zip_count', 'area_sq_miles', 'zip_density', 'lsr_match_count', 'damage_score', 'expires',
+]);
+const SORT_COLUMN_SQL = {
+  event: 'event',
+  zip_count: 'COALESCE(zip_count, 0)',
+  area_sq_miles: 'area_sq_miles',
+  zip_density: 'zip_density',
+  lsr_match_count: 'COALESCE(lsr_match_count, 0)',
+  damage_score: 'COALESCE(damage_score, 0)',
+  expires: 'expires',
+};
+
+/**
+ * Build ORDER BY clause from sort_mode preset or sort_by/sort_dir override. Whitelisted only.
+ * @param {object} filters - sort_mode?, sort_by?, sort_dir?
+ * @returns {string} ORDER BY expression (no leading "ORDER BY")
+ */
+function buildAlertsOrderBy(filters) {
+  const sortBy = filters.sort_by && String(filters.sort_by).toLowerCase();
+  const sortDir = (filters.sort_dir && String(filters.sort_dir).toLowerCase()) === 'asc' ? 'ASC' : 'DESC';
+  if (sortBy && SORT_COLUMNS.has(sortBy)) {
+    const expr = SORT_COLUMN_SQL[sortBy];
+    const nulls = sortBy === 'expires' ? ' NULLS LAST' : ' NULLS LAST';
+    return expr + ' ' + sortDir + nulls + ', COALESCE(damage_score, 0) DESC';
+  }
+  const mode = (filters.sort_mode && String(filters.sort_mode).toLowerCase()) || 'action';
+  switch (mode) {
+    case 'damage':
+      return 'COALESCE(lsr_match_count, 0) DESC, hail_max_inches DESC NULLS LAST, wind_max_mph DESC NULLS LAST, COALESCE(damage_score, 0) DESC';
+    case 'tight':
+      return 'zip_density DESC NULLS LAST, area_sq_miles ASC NULLS LAST, COALESCE(damage_score, 0) DESC';
+    case 'expires':
+      return 'expires ASC NULLS LAST, COALESCE(damage_score, 0) DESC';
+    case 'broad':
+      return 'area_sq_miles DESC NULLS LAST, COALESCE(zip_count, 0) DESC';
+    case 'action':
+    default:
+      return '(CASE WHEN interesting_any = true THEN 1 ELSE 0 END) DESC, COALESCE(damage_score, 0) DESC, COALESCE(lsr_match_count, 0) DESC, expires ASC NULLS LAST';
+  }
 }
 
 /**
@@ -773,6 +810,169 @@ async function getOutboxById(id) {
   return rows[0] || null;
 }
 
+/**
+ * State drilldown: summary counts and top lists for a state.
+ * @param {string} stateCode - e.g. TX, MD
+ * @returns {Promise<{ counts: object, top_events: object[], top_alerts: object[], updated_at: string }>}
+ */
+async function getStateSummary(stateCode) {
+  const state = String(stateCode).trim().toUpperCase();
+  if (!state) return { counts: {}, top_events: [], top_alerts: [], updated_at: new Date().toISOString() };
+
+  const baseWhere = `impacted_states @> ARRAY[$1]::text[]`;
+  const activeWhere = `(${baseWhere} AND (expires IS NULL OR expires > now()))`;
+
+  const [countsRes, topEventsRes, topAlertsRes, outboxRes] = await Promise.all([
+    pool.query(
+      `SELECT
+        COUNT(*) FILTER (WHERE expires IS NULL OR expires > now()) AS active_alerts,
+        COUNT(*) FILTER (WHERE (expires IS NULL OR expires > now()) AND COALESCE(alert_class, 'other') = 'warning') AS warnings,
+        COUNT(*) FILTER (WHERE (expires IS NULL OR expires > now()) AND interesting_any = true) AS interesting,
+        COALESCE(SUM(lsr_match_count), 0)::int AS lsr_total
+      FROM public.alert_impacted_zips WHERE ${baseWhere}`,
+      [state]
+    ),
+    pool.query(
+      `SELECT event, COUNT(*)::int AS count FROM public.alert_impacted_zips
+       WHERE ${activeWhere} GROUP BY event ORDER BY count DESC LIMIT 3`,
+      [state]
+    ),
+    pool.query(
+      `SELECT alert_id, event, COALESCE(damage_score, 0) AS score, COALESCE(zip_count, 0) AS zip_count, expires
+       FROM public.alert_impacted_zips WHERE ${baseWhere}
+       ORDER BY COALESCE(damage_score, 0) DESC, expires ASC NULLS LAST LIMIT 3`,
+      [state]
+    ),
+    pool.query(
+      `SELECT
+        COUNT(*) FILTER (WHERE o.status = 'queued')::int AS deliveries_queued,
+        COUNT(*) FILTER (WHERE o.status = 'failed')::int AS deliveries_failed
+      FROM public.zip_delivery_outbox o
+      JOIN public.alert_impacted_zips p ON p.alert_id = o.alert_id AND p.impacted_states @> ARRAY[$1]::text[]`,
+      [state]
+    ),
+  ]);
+
+  const c = countsRes.rows[0] || {};
+  const ob = outboxRes.rows[0] || {};
+  return {
+    counts: {
+      active_alerts: parseInt(c.active_alerts, 10) || 0,
+      warnings: parseInt(c.warnings, 10) || 0,
+      interesting: parseInt(c.interesting, 10) || 0,
+      lsr_total: parseInt(c.lsr_total, 10) || 0,
+      deliveries_queued: parseInt(ob.deliveries_queued, 10) || 0,
+      deliveries_failed: parseInt(ob.deliveries_failed, 10) || 0,
+    },
+    top_events: (topEventsRes.rows || []).map((r) => ({ event: r.event, count: r.count })),
+    top_alerts: (topAlertsRes.rows || []).map((r) => ({
+      alert_id: r.alert_id,
+      event: r.event,
+      score: r.score,
+      zip_count: r.zip_count,
+      expires: r.expires,
+    })),
+    updated_at: new Date().toISOString(),
+  };
+}
+
+/**
+ * Outbox rows for alerts that impact the given state.
+ */
+async function getOutboxByState(stateCode, limit = 50) {
+  const state = String(stateCode).trim().toUpperCase();
+  if (!state) return [];
+  const { rows } = await pool.query(
+    `SELECT o.* FROM public.zip_delivery_outbox o
+     JOIN public.alert_impacted_zips p ON p.alert_id = o.alert_id AND p.impacted_states @> ARRAY[$1]::text[]
+     ORDER BY o.created_at DESC LIMIT $2`,
+    [state, limit]
+  );
+  return rows || [];
+}
+
+/**
+ * Normalize place string for grouping: trim, collapse whitespace, uppercase. Optional: drop trailing " COUNTY".
+ */
+function normalizePlaceKey(place) {
+  if (place == null || typeof place !== 'string') return '';
+  let s = place.trim().replace(/\s+/g, ' ').toUpperCase();
+  if (s.endsWith(' COUNTY')) s = s.slice(0, -7).trim();
+  return s;
+}
+
+/**
+ * Tokenize area_desc: split on semicolon, trim, dedupe (order preserved).
+ */
+function tokenizeAreaDesc(areaDesc) {
+  if (areaDesc == null || typeof areaDesc !== 'string') return [];
+  const tokens = areaDesc.split(';').map((t) => t.trim()).filter(Boolean);
+  return [...new Set(tokens)];
+}
+
+/**
+ * State drilldown: LSR places (grouped) and area_desc tokens for a state.
+ * @param {string} stateCode
+ * @returns {Promise<{ lsr_places: object[], area_desc_tokens: object[] }>}
+ */
+async function getStatePlaces(stateCode) {
+  const state = String(stateCode).trim().toUpperCase();
+  if (!state) return { lsr_places: [], area_desc_tokens: [] };
+
+  const [lsrRes, areaRes] = await Promise.all([
+    pool.query(
+      `WITH normalized AS (
+        SELECT *,
+          TRIM(UPPER(REGEXP_REPLACE(COALESCE(place,''), '\\s+', ' ', 'g'))) AS place_key
+        FROM public.nws_lsr_observations
+        WHERE state = $1 AND place IS NOT NULL AND TRIM(place) <> ''
+      )
+      SELECT
+        MIN(place) AS place,
+        COUNT(*)::int AS obs_count,
+        MAX(hail_inches) AS hail_max_inches,
+        MAX(wind_mph)::int AS wind_max_mph,
+        COUNT(*) FILTER (WHERE event_type = 'TORNADO')::int AS tornado_count,
+        MAX(occurred_at) AS last_seen_at,
+        BOOL_OR(geom IS NOT NULL) AS has_geom
+      FROM normalized
+      GROUP BY place_key`,
+      [state]
+    ),
+    pool.query(
+      `SELECT n.area_desc FROM public.nws_alerts n
+       JOIN public.alert_impacted_zips p ON p.alert_id = n.id AND p.impacted_states @> ARRAY[$1]::text[]
+       WHERE n.area_desc IS NOT NULL AND TRIM(n.area_desc::text) <> ''`,
+      [state]
+    ),
+  ]);
+
+  const lsrRows = lsrRes.rows || [];
+  const lsr_places = lsrRows.map((r) => ({
+    place: r.place || '—',
+    obs_count: r.obs_count,
+    hail_max_inches: r.hail_max_inches,
+    wind_max_mph: r.wind_max_mph,
+    tornado_count: r.tornado_count,
+    last_seen_at: r.last_seen_at,
+    confidence: r.has_geom ? 'HIGH' : 'MEDIUM',
+  }));
+
+  const tokenCounts = new Map();
+  for (const row of areaRes.rows || []) {
+    const tokens = tokenizeAreaDesc(row.area_desc);
+    for (const t of tokens) {
+      tokenCounts.set(t, (tokenCounts.get(t) || 0) + 1);
+    }
+  }
+  const area_desc_tokens = Array.from(tokenCounts.entries()).map(([token, alert_count]) => ({
+    token,
+    alert_count,
+  })).sort((a, b) => b.alert_count - a.alert_count);
+
+  return { lsr_places, area_desc_tokens };
+}
+
 const POLL_SNAPSHOT_INSERT_SQL = `
   INSERT INTO public.nws_poll_snapshots (
     polled_at, duration_ms, fetched_count, actionable_count, geom_present_count,
@@ -831,11 +1031,18 @@ module.exports = {
   enqueueDelivery,
   getOutbox,
   getOutboxById,
+  getOutboxByState,
   updateOutboxRow,
   cancelOutboxRow,
   getAlertById,
   getAlerts,
   getAlertsByState,
+  getStateSummary,
+  getStatePlaces,
+  tokenizeAreaDesc,
+  normalizePlaceKey,
+  buildAlertsOrderBy,
+  SORT_COLUMNS,
   lsrPointInAlertGeometry,
   LSR_POINT_IN_GEOM_SQL,
   insertLsrMatch,

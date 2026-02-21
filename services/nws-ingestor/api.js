@@ -6,7 +6,7 @@
  */
 require('dotenv').config();
 const express = require('express');
-const { getAlerts, getAlertById, enqueueDelivery, getOutbox, getOutboxById, updateOutboxRow, cancelOutboxRow } = require('./db');
+const { getAlerts, getAlertById, enqueueDelivery, getOutbox, getOutboxById, getOutboxByState, updateOutboxRow, cancelOutboxRow, getStateSummary, getStatePlaces } = require('./db');
 const { buildDeliveryPayload } = require('./payloadBuilder');
 const { ingestOnce } = require('./index');
 
@@ -71,11 +71,18 @@ app.post('/v1/ingest/once', async (req, res) => {
   }
 });
 
-// GET /v1/alerts — one row per alert_id. Filters: state, class, interesting, geom_present, lsr_present, min_score, min_zip_count, max_zip_count, max_area_sq_miles. Sort: score_desc|expires_soon|newest|zip_density_desc
+// GET /v1/alerts — one row per alert_id.
+// Filters: state, class, interesting, geom_present, lsr_present, min_score, max_score, min_zip_count, max_zip_count, max_area_sq_miles.
+// Sort: sort_mode=action|damage|tight|expires|broad (default action), or sort_by=<column>&sort_dir=asc|desc.
+// Example URLs:
+//   /v1/alerts?sort_mode=action&class=warning&interesting=true&state=TX
+//   /v1/alerts?sort_mode=expires&geom_present=true
+//   /v1/alerts?sort_by=damage_score&sort_dir=desc&state=OK
 app.get('/v1/alerts', async (req, res) => {
   try {
     const active = req.query.active === 'true';
     const min_score = req.query.min_score != null ? Number(req.query.min_score) : undefined;
+    const max_score = req.query.max_score != null ? Number(req.query.max_score) : undefined;
     const state = req.query.state || undefined;
     const interesting = req.query.interesting;
     const class_ = req.query.class;
@@ -84,11 +91,14 @@ app.get('/v1/alerts', async (req, res) => {
     const min_zip_count = req.query.min_zip_count != null ? Number(req.query.min_zip_count) : undefined;
     const max_zip_count = req.query.max_zip_count != null ? Number(req.query.max_zip_count) : undefined;
     const max_area_sq_miles = req.query.max_area_sq_miles != null ? Number(req.query.max_area_sq_miles) : undefined;
-    const sort = req.query.sort;
+    const sort_mode = req.query.sort_mode || undefined;
+    const sort_by = req.query.sort_by || undefined;
+    const sort_dir = req.query.sort_dir || undefined;
     const actionable = req.query.actionable === 'true';
     const rows = await getAlerts({
       active,
       min_score,
+      max_score,
       state,
       interesting: interesting === 'true' ? true : interesting === 'false' ? false : undefined,
       actionable,
@@ -98,9 +108,84 @@ app.get('/v1/alerts', async (req, res) => {
       min_zip_count,
       max_zip_count,
       max_area_sq_miles,
-      sort,
+      sort_mode,
+      sort_by,
+      sort_dir,
     });
     res.json({ alerts: rows });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// GET /v1/states/:state/summary — state drilldown summary
+app.get('/v1/states/:state/summary', async (req, res) => {
+  try {
+    const state = req.params.state;
+    const summary = await getStateSummary(state);
+    res.json(summary);
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// GET /v1/states/:state/alerts — same as /v1/alerts but state forced
+app.get('/v1/states/:state/alerts', async (req, res) => {
+  try {
+    const state = req.params.state;
+    const active = req.query.active === 'true';
+    const min_score = req.query.min_score != null ? Number(req.query.min_score) : undefined;
+    const max_score = req.query.max_score != null ? Number(req.query.max_score) : undefined;
+    const interesting = req.query.interesting === 'true' ? true : req.query.interesting === 'false' ? false : undefined;
+    const class_ = req.query.class;
+    const geom_present = req.query.geom_present === 'true' ? true : req.query.geom_present === 'false' ? false : undefined;
+    const lsr_present = req.query.lsr_present === 'true' ? true : req.query.lsr_present === 'false' ? false : undefined;
+    const min_zip_count = req.query.min_zip_count != null ? Number(req.query.min_zip_count) : undefined;
+    const max_zip_count = req.query.max_zip_count != null ? Number(req.query.max_zip_count) : undefined;
+    const max_area_sq_miles = req.query.max_area_sq_miles != null ? Number(req.query.max_area_sq_miles) : undefined;
+    const sort_mode = req.query.sort_mode;
+    const sort_by = req.query.sort_by;
+    const sort_dir = req.query.sort_dir;
+    const rows = await getAlerts({
+      state,
+      active,
+      min_score,
+      max_score,
+      interesting,
+      class: class_,
+      geom_present,
+      lsr_present,
+      min_zip_count,
+      max_zip_count,
+      max_area_sq_miles,
+      sort_mode,
+      sort_by,
+      sort_dir,
+    });
+    res.json({ alerts: rows });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// GET /v1/states/:state/places — LSR places + area_desc tokens
+app.get('/v1/states/:state/places', async (req, res) => {
+  try {
+    const state = req.params.state;
+    const data = await getStatePlaces(state);
+    res.json(data);
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// GET /v1/states/:state/outbox — outbox entries for alerts in this state
+app.get('/v1/states/:state/outbox', async (req, res) => {
+  try {
+    const state = req.params.state;
+    const limit = req.query.limit != null ? Math.min(100, parseInt(req.query.limit, 10) || 50) : 50;
+    const rows = await getOutboxByState(state, limit);
+    res.json({ outbox: rows });
   } catch (e) {
     res.status(500).json({ error: e.message });
   }

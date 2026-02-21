@@ -36,10 +36,42 @@
     .tabs button.active { background: #3f3f46; color: #fff; }
     .tabs button:hover { background: #3f3f46; color: #e4e4e7; }
     .row-actions button { margin-right: 0.25rem; padding: 0.25rem 0.5rem; font-size: 0.8rem; }
+    .sort-mode select { min-width: 160px; }
+    .breadcrumb { color: #a1a1aa; font-size: 0.875rem; margin-bottom: 0.5rem; }
+    .breadcrumb a { color: #60a5fa; text-decoration: none; }
+    .breadcrumb a:hover { text-decoration: underline; }
+    .state-chip { display: inline-block; padding: 0.2rem 0.5rem; margin: 0.1rem; border-radius: 4px; background: #27272a; color: #60a5fa; cursor: pointer; font-size: 0.8rem; text-decoration: none; }
+    .state-chip:hover { background: #3f3f46; color: #fff; }
+    th.sortable { cursor: pointer; user-select: none; white-space: nowrap; }
+    th.sortable:hover { color: #fff; }
+    .sort-indicator { margin-left: 0.25rem; opacity: 0.8; }
+    .badge.bucket-small { background: #14532d; color: #bbf7d0; }
+    .badge.bucket-medium { background: #1e40af; color: #93c5fd; }
+    .badge.bucket-large { background: #7c2d12; color: #fed7aa; }
+    .badge.bucket-massive { background: #4c1d95; color: #e9d5ff; }
+    .filter-toggles label { margin-right: 0.75rem; }
     .copy-block { font-family: monospace; font-size: 0.75rem; white-space: pre-wrap; background: #18181b; padding: 1rem; border-radius: 6px; margin: 1rem 0; max-height: 300px; overflow: auto; }
     .alert { padding: 0.75rem; border-radius: 6px; margin: 0.5rem 0; }
     .alert.success { background: #14532d; color: #bbf7d0; }
     .alert.error { background: #7f1d1d; color: #fecaca; }
+    .drawer-overlay { position: fixed; top: 0; left: 0; right: 0; bottom: 0; background: rgba(0,0,0,0.5); z-index: 100; display: none; }
+    .drawer-overlay.open { display: block; }
+    .drawer-panel { position: fixed; top: 0; right: 0; width: min(480px, 100vw); height: 100vh; background: #18181b; border-left: 1px solid #27272a; z-index: 101; display: flex; flex-direction: column; box-shadow: -4px 0 20px rgba(0,0,0,0.3); }
+    .drawer-header { padding: 1rem; border-bottom: 1px solid #27272a; display: flex; justify-content: space-between; align-items: center; }
+    .drawer-header h2 { margin: 0; font-size: 1.1rem; }
+    .drawer-tabs { display: flex; gap: 0.25rem; padding: 0.5rem 1rem 0; border-bottom: 1px solid #27272a; flex-shrink: 0; }
+    .drawer-tabs button { padding: 0.4rem 0.75rem; border: none; background: transparent; color: #a1a1aa; cursor: pointer; font-size: 0.875rem; border-radius: 6px; }
+    .drawer-tabs button.active { background: #3f3f46; color: #fff; }
+    .drawer-body { flex: 1; overflow: auto; padding: 1rem; }
+    .drawer-body .tab-pane { display: none; }
+    .drawer-body .tab-pane.active { display: block; }
+    .summary-tiles { display: grid; grid-template-columns: repeat(2, 1fr); gap: 0.5rem; margin-bottom: 1rem; }
+    .summary-tile { background: #27272a; padding: 0.75rem; border-radius: 6px; font-size: 0.875rem; }
+    .summary-tile .value { font-weight: 600; color: #fff; }
+    .places-table, .drawer-alerts-table { font-size: 0.8rem; width: 100%; }
+    .confidence-high { color: #22c55e; }
+    .confidence-medium { color: #eab308; }
+    .confidence-low { color: #71717a; }
   </style>
 </head>
 <body>
@@ -62,18 +94,45 @@
       <button id="run-once-btn" class="primary" type="button">Run ingest once</button>
       <span id="run-once-status"></span>
     </p>
-    <div class="tabs">
-      <button type="button" id="tab-actionable" class="active">Actionable Now</button>
-      <button type="button" id="tab-all">All Alerts</button>
+    <div class="breadcrumb" id="breadcrumb">All Alerts</div>
+    <div class="sort-mode" style="margin-bottom: 0.5rem;">
+      <label>Sort mode:</label>
+      <select id="sort-mode">
+        <option value="action" selected>Action Priority</option>
+        <option value="damage">Confirmed Damage</option>
+        <option value="tight">Tight Impact Zones</option>
+        <option value="expires">Expiring Soon</option>
+        <option value="broad">Broad Systems</option>
+      </select>
+      <button type="button" id="sort-reset-preset" style="margin-left: 0.5rem;">Reset to preset</button>
     </div>
-    <p>Filters: <input type="text" id="filter-state" placeholder="State (e.g. TX)" />
-    <select id="filter-class"><option value="">All</option><option value="warning">Warning</option><option value="watch">Watch</option><option value="advisory">Advisory</option><option value="statement">Statement</option><option value="other">Other</option></select>
-    <label><input type="checkbox" id="filter-active" /> Active only</label>
-    <label><input type="checkbox" id="filter-interesting" /> Interesting only</label>
-    <input type="number" id="filter-min-score" placeholder="Min score" style="width:80px" />
-    <button id="filter-apply">Apply</button></p>
+    <div class="filter-toggles" style="margin-bottom: 0.5rem;">
+      <label><input type="checkbox" id="filter-warnings-only" /> Warnings only</label>
+      <label><input type="checkbox" id="filter-interesting-only" /> Interesting only</label>
+      <label><input type="checkbox" id="filter-lsr-only" /> LSR only</label>
+      <label><input type="checkbox" id="filter-hide-geom-missing" /> Hide GEOM MISSING</label>
+      <label><input type="checkbox" id="filter-active" /> Active only</label>
+      <input type="number" id="filter-max-zip-count" placeholder="Max ZIPs" style="width:80px" title="max_zip_count" />
+      <input type="number" id="filter-max-area" placeholder="Max area (sq mi)" style="width:100px" title="max_area_sq_miles" />
+      <input type="text" id="filter-state" placeholder="State" style="width:60px" />
+      <button type="button" id="filter-clear-state">Clear state</button>
+      <button id="filter-apply">Apply</button>
+    </div>
     <table id="alerts-table">
-      <thead><tr><th>Event</th><th>States</th><th>ZIPs</th><th>Geom</th><th>Area</th><th>Density</th><th>LSR</th><th>Score</th><th>Badges</th><th>Actions</th></tr></thead>
+      <thead><tr>
+        <th class="sortable" data-sort="event">Event <span class="sort-indicator"></span></th>
+        <th>States</th>
+        <th class="sortable" data-sort="zip_count">ZIPs <span class="sort-indicator"></span></th>
+        <th>Size</th>
+        <th>Geom</th>
+        <th class="sortable" data-sort="area_sq_miles">Area <span class="sort-indicator"></span></th>
+        <th class="sortable" data-sort="zip_density">Density <span class="sort-indicator"></span></th>
+        <th class="sortable" data-sort="expires">Expires In <span class="sort-indicator"></span></th>
+        <th class="sortable" data-sort="lsr_match_count">LSR <span class="sort-indicator"></span></th>
+        <th class="sortable" data-sort="damage_score">Score <span class="sort-indicator"></span></th>
+        <th>Badges</th>
+        <th>Actions</th>
+      </tr></thead>
       <tbody></tbody>
     </table>
   </section>
@@ -95,6 +154,42 @@
       <tbody></tbody>
     </table>
   </section>
+
+  <div id="state-drawer-overlay" class="drawer-overlay" aria-hidden="true"></div>
+  <div id="state-drawer-panel" class="drawer-panel" aria-hidden="true" style="display:none;">
+    <div class="drawer-header">
+      <h2 id="drawer-title">State: —</h2>
+      <button type="button" id="drawer-close" aria-label="Close drawer">×</button>
+    </div>
+    <div class="drawer-tabs">
+      <button type="button" data-drawer-tab="overview">Overview</button>
+      <button type="button" data-drawer-tab="alerts">Alerts</button>
+      <button type="button" data-drawer-tab="places">Places (Cities) v1</button>
+      <button type="button" data-drawer-tab="outbox">Outbox (State)</button>
+    </div>
+    <div class="drawer-body">
+      <div id="drawer-tab-overview" class="tab-pane">
+        <div id="drawer-summary-tiles" class="summary-tiles"></div>
+        <p><strong>Top events</strong></p>
+        <ul id="drawer-top-events"></ul>
+        <p><strong>Top alerts by score</strong></p>
+        <ul id="drawer-top-alerts"></ul>
+        <p style="margin-top:1rem;"><strong>Client Territory</strong> <span class="confidence-low">(optional — not configured)</span></p>
+      </div>
+      <div id="drawer-tab-alerts" class="tab-pane">
+        <table class="drawer-alerts-table"><thead><tr><th>Event</th><th>Class</th><th>ZIPs</th><th>Geom</th><th>Expires</th><th>LSR</th><th>Score</th><th></th></tr></thead><tbody id="drawer-alerts-tbody"></tbody></table>
+      </div>
+      <div id="drawer-tab-places" class="tab-pane">
+        <p><strong>LSR Places (higher signal)</strong></p>
+        <table class="places-table"><thead><tr><th>Place</th><th>Obs</th><th>Hail max</th><th>Wind max</th><th>Tornado</th><th>Last seen</th><th>Confidence</th></tr></thead><tbody id="drawer-lsr-places-tbody"></tbody></table>
+        <p style="margin-top:1rem;"><strong>Area Descriptions (Counties/Zones)</strong> <span class="confidence-low">— LOW CONFIDENCE (not city)</span></p>
+        <ul id="drawer-area-desc-tokens"></ul>
+      </div>
+      <div id="drawer-tab-outbox" class="tab-pane">
+        <table class="places-table"><thead><tr><th>Status</th><th>Created</th><th>Destination</th><th>ZIPs</th><th>Attempts</th><th>Last error</th><th></th></tr></thead><tbody id="drawer-outbox-tbody"></tbody></table>
+      </div>
+    </div>
+  </div>
 
   <script src="app.js"></script>
 </body>
