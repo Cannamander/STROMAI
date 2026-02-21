@@ -32,6 +32,7 @@ ON CONFLICT (id) DO UPDATE SET
 `;
 
 const SOURCE = 'nws-ingestor';
+const { computeTriage } = require('./triage');
 
 /**
  * @param {object[]} rows - Normalized rows from normalize.js
@@ -550,6 +551,71 @@ async function updateAlertThresholdsAndScore(hailInches, windMph, freezeRareStat
 }
 
 /**
+ * Update triage fields for all alerts where triage_status_source = 'system'.
+ * Call after updateAlertThresholdsAndScore so LSR/threshold data is current.
+ */
+async function updateTriageForSystemOwnedAlerts() {
+  const { rows } = await pool.query(
+    `SELECT alert_id, alert_class, interesting_any, geom_present, COALESCE(lsr_match_count, 0) AS lsr_match_count,
+     interesting_hail, interesting_wind, hail_max_inches, wind_max_mph, event
+     FROM public.alert_impacted_zips WHERE COALESCE(triage_status_source, 'system') = 'system'`
+  );
+  for (const row of rows) {
+    const { status, reasons, confidence_level } = computeTriage(row);
+    await pool.query(
+      `UPDATE public.alert_impacted_zips SET
+       triage_status = $1, triage_reasons = $2, confidence_level = $3,
+       triage_status_updated_at = now() WHERE alert_id = $4`,
+      [status, reasons, confidence_level, row.alert_id]
+    );
+  }
+}
+
+/**
+ * Insert one row into nws_triage_audit.
+ */
+async function insertTriageAudit(alertId, actor, action, prevStatus, newStatus, note) {
+  await pool.query(
+    `INSERT INTO public.nws_triage_audit (alert_id, actor, action, prev_status, new_status, note)
+     VALUES ($1, $2, $3, $4, $5, $6)`,
+    [alertId, actor ?? null, action, prevStatus, newStatus, note ?? null]
+  );
+}
+
+/**
+ * Update one alert's triage fields (for operator action or reset).
+ */
+async function updateAlertTriage(alertId, payload) {
+  const sets = [];
+  const values = [];
+  let i = 1;
+  if (payload.triage_status != null) { sets.push(`triage_status = $${i++}`); values.push(payload.triage_status); }
+  if (payload.triage_status_source != null) { sets.push(`triage_status_source = $${i++}`); values.push(payload.triage_status_source); }
+  if (payload.triage_reasons != null) { sets.push(`triage_reasons = $${i++}`); values.push(payload.triage_reasons); }
+  if (payload.confidence_level != null) { sets.push(`confidence_level = $${i++}`); values.push(payload.confidence_level); }
+  if (payload.triage_status_updated_by !== undefined) { sets.push(`triage_status_updated_by = $${i++}`); values.push(payload.triage_status_updated_by); }
+  sets.push('triage_status_updated_at = now()');
+  if (sets.length <= 1) return;
+  values.push(alertId);
+  await pool.query(
+    `UPDATE public.alert_impacted_zips SET ${sets.join(', ')} WHERE alert_id = $${i}`,
+    values
+  );
+}
+
+/**
+ * Get last N triage audit entries for an alert.
+ */
+async function getTriageAudit(alertId, limit = 20) {
+  const { rows } = await pool.query(
+    `SELECT id, ts, alert_id, actor, action, prev_status, new_status, note
+     FROM public.nws_triage_audit WHERE alert_id = $1 ORDER BY ts DESC LIMIT $2`,
+    [alertId, limit]
+  );
+  return rows;
+}
+
+/**
  * Generate stable event_key for outbox idempotency: alert_id + payload_version + hash of sorted zips.
  * @param {string} alertId
  * @param {number} payloadVersion
@@ -706,6 +772,14 @@ async function getAlerts(filters = {}) {
   if (filters.since_last_ingest === true) {
     conditions.push('((SELECT updated_at FROM public.last_ingest_run WHERE id = 1 LIMIT 1) IS NULL OR last_seen_at >= (SELECT updated_at FROM public.last_ingest_run WHERE id = 1 LIMIT 1))');
   }
+  const triageStatus = filters.triage_status && String(filters.triage_status).toLowerCase();
+  if (['new', 'monitoring', 'actionable', 'sent_manual', 'suppressed'].includes(triageStatus)) {
+    conditions.push(`COALESCE(triage_status, 'new') = $${i++}`);
+    params.push(triageStatus);
+  }
+  if (filters.work_queue === true) {
+    conditions.push("COALESCE(triage_status, 'new') IN ('actionable', 'monitoring')");
+  }
   const where = conditions.length ? ' WHERE ' + conditions.join(' AND ') : '';
   const orderBy = buildAlertsOrderBy(filters);
   const sql = `SELECT * FROM public.alert_impacted_zips ${where} ORDER BY ${orderBy} LIMIT 500`;
@@ -751,6 +825,8 @@ function buildAlertsOrderBy(filters) {
   }
   const mode = (filters.sort_mode && String(filters.sort_mode).toLowerCase()) || 'action';
   switch (mode) {
+    case 'work_queue':
+      return "(CASE WHEN COALESCE(triage_status, 'new') = 'actionable' THEN 0 WHEN COALESCE(triage_status, 'new') = 'monitoring' THEN 1 ELSE 2 END) ASC, COALESCE(damage_score, 0) DESC, expires ASC NULLS LAST";
     case 'damage':
       return 'COALESCE(lsr_match_count, 0) DESC, hail_max_inches DESC NULLS LAST, wind_max_mph DESC NULLS LAST, COALESCE(damage_score, 0) DESC';
     case 'tight':
@@ -1239,6 +1315,10 @@ module.exports = {
   runSetBasedLsrMatch,
   updateAlertLsrSummary,
   updateAlertThresholdsAndScore,
+  updateTriageForSystemOwnedAlerts,
+  insertTriageAudit,
+  updateAlertTriage,
+  getTriageAudit,
   getAlertLsrSummaries,
   buildEventKey,
   enqueueDelivery,

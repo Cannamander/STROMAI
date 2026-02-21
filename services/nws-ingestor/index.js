@@ -3,7 +3,7 @@ const config = require('./config');
 const { fetchActiveAlerts } = require('./nwsClient');
 const { normalizeFeature } = require('./normalize');
 const { classifyAlert, isActionable } = require('./activation');
-const { upsertAlerts, getAreaSqMiles, getZipsByGeometry, getZipsByPoint, getZipsByUgc, insertUgcZips, upsertAlertImpactedZips, insertPollSnapshot, getAlertLsrSummaries, updateAlertThresholdsAndScore, closePool } = require('./db');
+const { upsertAlerts, getAreaSqMiles, getZipsByGeometry, getZipsByPoint, getZipsByUgc, insertUgcZips, upsertAlertImpactedZips, insertPollSnapshot, getAlertLsrSummaries, updateAlertThresholdsAndScore, updateTriageForSystemOwnedAlerts, closePool } = require('./db');
 const { deriveAlertClass, deriveGeoMethod, deriveZipInferenceMethod, computeZipDensity } = require('./alertClass');
 const { FREEZE_EVENT_NAMES } = require('./thresholds');
 const { runLsrPipeline } = require('./lsrEnrich');
@@ -324,6 +324,13 @@ async function ingestOnce(opts = {}) {
     } catch (thrErr) {
       errorsCount++;
       log.errorMsg('Thresholds/score update failed: ' + (thrErr && thrErr.message));
+    }
+
+    try {
+      await updateTriageForSystemOwnedAlerts();
+    } catch (triageErr) {
+      errorsCount++;
+      log.errorMsg('Triage update failed: ' + (triageErr && triageErr.message));
     }
 
     const duration_ms = Date.now() - start;

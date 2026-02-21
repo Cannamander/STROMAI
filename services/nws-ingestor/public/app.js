@@ -122,6 +122,10 @@
     if (maxZip) params.set('max_zip_count', maxZip);
     var maxArea = document.getElementById('filter-max-area') && document.getElementById('filter-max-area').value;
     if (maxArea) params.set('max_area_sq_miles', maxArea);
+    var triageFilter = document.getElementById('filter-triage') && document.getElementById('filter-triage').value;
+    if (triageFilter) params.set('triage_status', triageFilter);
+    var sortMode = (document.getElementById('sort-mode') && document.getElementById('sort-mode').value) || 'action';
+    if (sortMode === 'work_queue') params.set('work_queue', 'true');
     return params;
   }
 
@@ -592,6 +596,10 @@
       var expiresIn = formatExpiresIn(a.expires);
       var lsrCount = a.lsr_match_count != null ? a.lsr_match_count : 0;
       var score = a.damage_score != null ? a.damage_score : 0;
+      var triageStatus = (a.triage_status || 'new').toLowerCase();
+      var triageClass = ['actionable', 'monitoring', 'sent_manual', 'suppressed', 'new'].indexOf(triageStatus) >= 0 ? triageStatus : 'new';
+      var conf = (a.confidence_level || 'low').toLowerCase();
+      var triageCell = '<span class="triage-pill ' + triageClass + '">' + escapeHtml(triageStatus) + '</span> <span class="confidence-' + conf + '" title="Confidence">' + escapeHtml(conf) + '</span>';
       var badges = [];
       if (a.interesting_hail) badges.push('<span class="badge hail">HAIL 1.25+</span>');
       if (a.interesting_wind) badges.push('<span class="badge wind">WIND 70+</span>');
@@ -610,6 +618,7 @@
         '<td>' + escapeHtml(expiresIn) + '</td>' +
         '<td>' + Number(lsrCount) + '</td>' +
         '<td>' + Number(score) + '</td>' +
+        '<td>' + triageCell + '</td>' +
         '<td>' + badges.join('') + '</td>' +
         '<td class="row-actions">' +
         '<button type="button" class="row-view-btn" data-id="' + escapeHtml(alertId) + '">View</button>' +
@@ -627,7 +636,7 @@
     updateSortIndicators();
     if (alerts.length === 0) {
       var empty = document.createElement('tr');
-      empty.innerHTML = '<td colspan="12">No alerts. Run "Run ingest once" or adjust filters.</td>';
+      empty.innerHTML = '<td colspan="13">No alerts. Run "Run ingest once" or adjust filters.</td>';
       tbody.appendChild(empty);
     }
   }
@@ -688,6 +697,11 @@
     var lsrBlock = 'LSR: ' + (alert.lsr_match_count ?? 0) + ' matches. Hail max: ' + (alert.hail_max_inches ?? '—') + ' in. Wind max: ' + (alert.wind_max_mph ?? '—') + ' mph. Tornado: ' + (alert.tornado_count ?? 0) + '. Flood: ' + (alert.flood_count ?? 0) + '.';
     var why = whyZipsHelper(alert);
     var whyHtml = why ? '<p class="alert" style="background:#27272a;color:#a1a1aa;"><strong>Why so many ZIPs?</strong> ' + why + '</p>' : '';
+    var triageReasons = alert.triage_reasons && Array.isArray(alert.triage_reasons) ? alert.triage_reasons : [];
+    var confidenceLevel = (alert.confidence_level || 'low').toLowerCase();
+    var whyPrioritizedHtml = '<p class="alert" style="background:#27272a;color:#a1a1aa;"><strong>Why this is prioritized</strong><br/>' +
+      (triageReasons.length ? '<ul style="margin:0.5rem 0 0 1rem;">' + triageReasons.map(function (r) { return '<li>' + escapeHtml(r) + '</li>'; }).join('') + '</ul>' : '') +
+      '<span class="confidence-' + confidenceLevel + '" style="margin-top:0.5rem;display:inline-block;">Confidence: ' + escapeHtml(confidenceLevel) + '</span></p>';
     var html =
       '<table style="font-size:0.875rem;"><tr><td>Event</td><td>' + escapeHtml(alert.event || '—') + ' <span class="badge class">' + escapeHtml(alert.alert_class || 'other') + '</span></td></tr>' +
       '<tr><td>Severity</td><td>' + escapeHtml(alert.severity || '—') + '</td></tr>' +
@@ -701,12 +715,45 @@
       '<tr><td>ZIP density</td><td>' + densityStr + '</td></tr>' +
       '<tr><td>LSR summary</td><td>' + escapeHtml(lsrBlock) + '</td></tr>' +
       '<tr><td>Score / Delivery</td><td>' + (alert.damage_score ?? 0) + ' / ' + escapeHtml(alert.delivery_status || '—') + '</td></tr></table>' +
+      whyPrioritizedHtml +
       whyHtml +
       '<p><strong>Copy block</strong></p><div class="copy-block" id="copy-block">' + buildCopyBlock(alert).replace(/</g, '&lt;').replace(/>/g, '&gt;') + '</div>';
     document.getElementById('detail-content').innerHTML = html;
+    var triageActionsEl = document.getElementById('detail-triage-actions');
+    triageActionsEl.innerHTML =
+      '<p style="margin-bottom:0.5rem;"><strong>Triage</strong></p>' +
+      '<button type="button" class="triage-action-btn" data-action="set_actionable">Mark Actionable</button> ' +
+      '<button type="button" class="triage-action-btn" data-action="set_monitoring">Mark Monitoring</button> ' +
+      '<button type="button" class="triage-action-btn" data-action="set_suppressed">Suppress</button> ' +
+      '<button type="button" class="triage-action-btn" data-action="set_sent_manual">Mark Sent (Manual)</button> ' +
+      '<button type="button" class="triage-action-btn" data-action="reset_to_system">Reset to System</button>';
+    triageActionsEl.querySelectorAll('.triage-action-btn').forEach(function (btn) {
+      btn.addEventListener('click', function () {
+        var action = btn.getAttribute('data-action');
+        if (action && currentAlert && currentAlert.alert_id) performTriageAction(currentAlert.alert_id, action);
+      });
+    });
     document.getElementById('download-csv-btn').href = (config.apiBase || '') + '/v1/alerts/' + encodeURIComponent(alertId) + '/zips.csv';
     document.getElementById('detail-message').innerHTML = '';
+    var auditEl = document.getElementById('detail-audit');
+    if (auditEl) { auditEl.style.display = 'none'; auditEl.innerHTML = ''; }
     showPage('detail');
+  }
+
+  async function performTriageAction(alertId, action) {
+    try {
+      await api('/v1/alerts/' + encodeURIComponent(alertId) + '/triage', {
+        method: 'POST',
+        body: JSON.stringify({ action: action, note: null }),
+      });
+      if (window.showCopyFeedback) window.showCopyFeedback('Triage updated.');
+      else document.getElementById('detail-message').innerHTML = '<div class="alert success">Triage updated.</div>';
+      var updated = await api('/v1/alerts/' + encodeURIComponent(alertId));
+      currentAlert = updated;
+      openDetail(alertId, detailBackToPage === 'map');
+    } catch (e) {
+      document.getElementById('detail-message').innerHTML = '<div class="alert error">' + escapeHtml(e.message) + '</div>';
+    }
   }
 
   document.getElementById('copy-zips-lsr-btn').addEventListener('click', () => {
@@ -737,6 +784,33 @@
     showPage(detailBackToPage);
     if (detailBackToPage === 'dashboard') loadAlerts();
   });
+
+  var showAuditBtn = document.getElementById('detail-show-audit-btn');
+  if (showAuditBtn) {
+    showAuditBtn.addEventListener('click', async function () {
+      if (!currentAlert || !currentAlert.alert_id) return;
+      var auditEl = document.getElementById('detail-audit');
+      if (!auditEl) return;
+      if (auditEl.style.display === 'block' && auditEl.dataset.alertId === currentAlert.alert_id) {
+        auditEl.style.display = 'none';
+        return;
+      }
+      try {
+        var data = await api('/v1/alerts/' + encodeURIComponent(currentAlert.alert_id) + '/audit?limit=20');
+        var rows = data.audit || [];
+        auditEl.innerHTML = '<table class="places-table"><thead><tr><th>Time</th><th>Actor</th><th>Action</th><th>Prev</th><th>New</th><th>Note</th></tr></thead><tbody>' +
+          rows.map(function (r) {
+            var ts = r.ts ? new Date(r.ts).toLocaleString() : '—';
+            return '<tr><td>' + escapeHtml(ts) + '</td><td>' + escapeHtml(r.actor || '—') + '</td><td>' + escapeHtml(r.action || '—') + '</td><td>' + escapeHtml(r.prev_status || '—') + '</td><td>' + escapeHtml(r.new_status || '—') + '</td><td>' + escapeHtml(r.note || '—') + '</td></tr>';
+          }).join('') + '</tbody></table>';
+        auditEl.dataset.alertId = currentAlert.alert_id;
+        auditEl.style.display = 'block';
+      } catch (e) {
+        auditEl.innerHTML = '<div class="alert error">Audit load failed: ' + escapeHtml(e.message) + '</div>';
+        auditEl.style.display = 'block';
+      }
+    });
+  }
 
   async function loadOutbox() {
     const status = new URLSearchParams(window.location.search).get('status') || '';

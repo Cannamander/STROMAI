@@ -6,8 +6,9 @@
  */
 require('dotenv').config();
 const express = require('express');
-const { getAlerts, getAlertById, enqueueDelivery, getOutbox, getOutboxById, getOutboxByState, updateOutboxRow, cancelOutboxRow, getStateSummary, getStatePlaces, getMapAlerts, getMapZips, getMapMeta, setLastIngestRun } = require('./db');
+const { getAlerts, getAlertById, updateAlertTriage, insertTriageAudit, getTriageAudit, enqueueDelivery, getOutbox, getOutboxById, getOutboxByState, updateOutboxRow, cancelOutboxRow, getStateSummary, getStatePlaces, getMapAlerts, getMapZips, getMapMeta, setLastIngestRun } = require('./db');
 const { buildDeliveryPayload } = require('./payloadBuilder');
+const { computeTriage, actionToStatus, TRIAGE_ACTIONS } = require('./triage');
 const { ingestOnce } = require('./index');
 
 const path = require('path');
@@ -92,10 +93,12 @@ app.get('/v1/alerts', async (req, res) => {
     const min_zip_count = req.query.min_zip_count != null ? Number(req.query.min_zip_count) : undefined;
     const max_zip_count = req.query.max_zip_count != null ? Number(req.query.max_zip_count) : undefined;
     const max_area_sq_miles = req.query.max_area_sq_miles != null ? Number(req.query.max_area_sq_miles) : undefined;
-    const sort_mode = req.query.sort_mode || undefined;
+    const sort_mode = req.query.sort_mode || (req.query.work_queue === 'true' ? 'work_queue' : undefined);
     const sort_by = req.query.sort_by || undefined;
     const sort_dir = req.query.sort_dir || undefined;
     const actionable = req.query.actionable === 'true';
+    const work_queue = req.query.work_queue === 'true';
+    const triage_status = req.query.triage_status || undefined;
     const since_last_ingest = req.query.since_last_ingest !== 'false'; // default true for testing: only show alerts from last "run ingest once"
     const rows = await getAlerts({
       active,
@@ -114,6 +117,8 @@ app.get('/v1/alerts', async (req, res) => {
       sort_mode,
       sort_by,
       sort_dir,
+      work_queue,
+      triage_status,
     });
     res.json({ alerts: rows });
   } catch (e) {
@@ -267,6 +272,81 @@ app.get('/v1/alerts/:alert_id', async (req, res) => {
     const alert = await getAlertById(req.params.alert_id);
     if (!alert) return res.status(404).json({ error: 'Alert not found' });
     res.json(alert);
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// POST /v1/alerts/:alert_id/triage — operator triage actions
+// Body: { action: "set_actionable"|"set_monitoring"|"set_suppressed"|"set_sent_manual"|"reset_to_system", note?: string }
+app.post('/v1/alerts/:alert_id/triage', async (req, res) => {
+  try {
+    const alertId = req.params.alert_id;
+    const alert = await getAlertById(alertId);
+    if (!alert) return res.status(404).json({ error: 'Alert not found' });
+
+    const body = req.body || {};
+    const action = body.action && String(body.action).toLowerCase();
+    if (!action || !TRIAGE_ACTIONS.has(action)) {
+      return res.status(400).json({ error: 'action required: set_actionable, set_monitoring, set_suppressed, set_sent_manual, or reset_to_system' });
+    }
+
+    const prevStatus = alert.triage_status || 'new';
+    const actor = req.user && (req.user.email || req.user.id);
+
+    if (action === 'reset_to_system') {
+      const { status, reasons, confidence_level } = computeTriage(alert);
+      await updateAlertTriage(alertId, {
+        triage_status: status,
+        triage_status_source: 'system',
+        triage_reasons: reasons,
+        confidence_level,
+        triage_status_updated_by: null,
+      });
+      await insertTriageAudit(alertId, actor, action, prevStatus, status, body.note);
+      const updated = await getAlertById(alertId);
+      return res.json({
+        triage_status: updated.triage_status,
+        triage_status_source: updated.triage_status_source,
+        triage_reasons: updated.triage_reasons || [],
+        confidence_level: updated.confidence_level,
+        triage_status_updated_at: updated.triage_status_updated_at,
+        triage_status_updated_by: updated.triage_status_updated_by,
+      });
+    }
+
+    const newStatus = actionToStatus(action);
+    if (!newStatus) return res.status(400).json({ error: 'Invalid action' });
+
+    await updateAlertTriage(alertId, {
+      triage_status: newStatus,
+      triage_status_source: 'operator',
+      triage_status_updated_by: actor,
+    });
+    await insertTriageAudit(alertId, actor, action, prevStatus, newStatus, body.note);
+
+    const updated = await getAlertById(alertId);
+    res.json({
+      triage_status: updated.triage_status,
+      triage_status_source: updated.triage_status_source,
+      triage_reasons: updated.triage_reasons || [],
+      confidence_level: updated.confidence_level,
+      triage_status_updated_at: updated.triage_status_updated_at,
+      triage_status_updated_by: updated.triage_status_updated_by,
+    });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// GET /v1/alerts/:alert_id/audit — last 20 triage audit entries
+app.get('/v1/alerts/:alert_id/audit', async (req, res) => {
+  try {
+    const alert = await getAlertById(req.params.alert_id);
+    if (!alert) return res.status(404).json({ error: 'Alert not found' });
+    const limit = Math.min(50, parseInt(req.query.limit, 10) || 20);
+    const rows = await getTriageAudit(req.params.alert_id, limit);
+    res.json({ audit: rows });
   } catch (e) {
     res.status(500).json({ error: e.message });
   }
