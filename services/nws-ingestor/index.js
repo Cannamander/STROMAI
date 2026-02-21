@@ -3,10 +3,10 @@ const config = require('./config');
 const { fetchActiveAlerts } = require('./nwsClient');
 const { normalizeFeature } = require('./normalize');
 const { classifyAlert, isActionable } = require('./activation');
-const { upsertAlerts, getAreaSqMiles, getZipsByGeometry, getZipsByPoint, getZipsByUgc, insertUgcZips, upsertAlertImpactedZips, insertPollSnapshot, getAlertLsrSummaries, updateAlertThresholdsAndScore, updateTriageForSystemOwnedAlerts, closePool } = require('./db');
+const { upsertAlerts, getAreaSqMiles, getZipsByGeometry, getZipsByPoint, getZipsByUgc, insertUgcZips, upsertAlertImpactedZips, insertPollSnapshot, getAlertLsrSummaries, updateAlertThresholdsAndScore, updateTriageForSystemOwnedAlerts, markLsrMatchedAndExpired, startLsrHoldForEligibleAlerts, closePool } = require('./db');
 const { deriveAlertClass, deriveGeoMethod, deriveZipInferenceMethod, computeZipDensity } = require('./alertClass');
 const { FREEZE_EVENT_NAMES } = require('./thresholds');
-const { runLsrPipeline } = require('./lsrEnrich');
+const { runLsrPipeline, runLsrRecheckLoop } = require('./lsrEnrich');
 const { fetchZoneGeometry } = require('./zoneClient');
 const log = require('./logger');
 
@@ -315,6 +315,14 @@ async function ingestOnce(opts = {}) {
     }
 
     try {
+      await markLsrMatchedAndExpired();
+      await startLsrHoldForEligibleAlerts(config.lsrHoldMaxMinutes ?? 60);
+    } catch (holdErr) {
+      errorsCount++;
+      log.errorMsg('LSR hold start failed: ' + (holdErr && holdErr.message));
+    }
+
+    try {
       await updateAlertThresholdsAndScore(
         config.interestingHailInches,
         config.interestingWindMph,
@@ -331,6 +339,13 @@ async function ingestOnce(opts = {}) {
     } catch (triageErr) {
       errorsCount++;
       log.errorMsg('Triage update failed: ' + (triageErr && triageErr.message));
+    }
+
+    try {
+      await runLsrRecheckLoop();
+    } catch (recheckErr) {
+      errorsCount++;
+      log.errorMsg('LSR recheck failed: ' + (recheckErr && recheckErr.message));
     }
 
     const duration_ms = Date.now() - start;

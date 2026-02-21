@@ -78,6 +78,11 @@
     .triage-pill.sent_manual { background: #16a34a; color: #fff; }
     .triage-pill.suppressed { background: #3f3f46; color: #a1a1aa; }
     .triage-pill.new { background: #27272a; color: #a1a1aa; }
+    .lsr-status-pill { display: inline-block; padding: 0.2rem 0.5rem; border-radius: 4px; font-size: 0.75rem; }
+    .lsr-status-pill.none { background: #27272a; color: #71717a; }
+    .lsr-status-pill.awaiting { background: #78350f; color: #fde68a; }
+    .lsr-status-pill.matched { background: #14532d; color: #bbf7d0; }
+    .lsr-status-pill.expired { background: #3f3f46; color: #a1a1aa; }
     .map-layout { display: grid; grid-template-columns: 280px 1fr; gap: 0; min-height: 75vh; }
     .map-left { background: #18181b; border-right: 1px solid #27272a; padding: 1rem; overflow: auto; }
     .map-left label { display: block; margin-top: 0.5rem; font-size: 0.875rem; }
@@ -159,6 +164,7 @@
         <th class="sortable" data-sort="zip_density">Density <span class="sort-indicator"></span></th>
         <th class="sortable" data-sort="expires">Expires In <span class="sort-indicator"></span></th>
         <th class="sortable" data-sort="lsr_match_count">LSR <span class="sort-indicator"></span></th>
+        <th>LSR Status</th>
         <th class="sortable" data-sort="damage_score">Score <span class="sort-indicator"></span></th>
         <th>Triage</th>
         <th>Badges</th>
@@ -171,8 +177,9 @@
   <section id="detail">
     <p><a href="#" id="detail-back">← Back to Dashboard</a></p>
     <div id="detail-content"></div>
+    <div id="detail-lsr-status" style="margin: 1rem 0; font-size: 0.875rem;"></div>
     <div id="detail-triage-actions" style="margin: 1rem 0;"></div>
-    <p><button type="button" id="detail-show-audit-btn">Show audit (last 20)</button></p>
+    <p><button type="button" id="detail-recheck-lsr-btn">Recheck LSR now</button> <button type="button" id="detail-show-audit-btn">Show audit (last 20)</button></p>
     <div id="detail-audit" style="display:none; margin: 1rem 0; font-size: 0.8rem;"></div>
     <p>
       <button id="copy-zips-lsr-btn" class="primary">Copy ZIPs + LSR Summary</button>

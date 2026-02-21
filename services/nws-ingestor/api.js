@@ -10,6 +10,7 @@ const { getAlerts, getAlertById, updateAlertTriage, insertTriageAudit, getTriage
 const { buildDeliveryPayload } = require('./payloadBuilder');
 const { computeTriage, actionToStatus, TRIAGE_ACTIONS } = require('./triage');
 const { ingestOnce } = require('./index');
+const { runLsrRecheckForAlert } = require('./lsrEnrich');
 
 const path = require('path');
 const app = express();
@@ -347,6 +348,25 @@ app.get('/v1/alerts/:alert_id/audit', async (req, res) => {
     const limit = Math.min(50, parseInt(req.query.limit, 10) || 20);
     const rows = await getTriageAudit(req.params.alert_id, limit);
     res.json({ audit: rows });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// POST /v1/alerts/:alert_id/lsr-recheck — run LSR matching for this alert only, return updated alert
+app.post('/v1/alerts/:alert_id/lsr-recheck', async (req, res) => {
+  try {
+    const alertId = req.params.alert_id;
+    const alert = await getAlertById(alertId);
+    if (!alert) return res.status(404).json({ error: 'Alert not found' });
+    await runLsrRecheckForAlert(alertId);
+    const updated = await getAlertById(alertId);
+    if (updated && (updated.triage_status_source || 'system') === 'system') {
+      const { status, reasons, confidence_level } = computeTriage(updated);
+      await updateAlertTriage(alertId, { triage_status: status, triage_status_source: 'system', triage_reasons: reasons, confidence_level });
+    }
+    const out = await getAlertById(alertId);
+    return res.json(out);
   } catch (e) {
     res.status(500).json({ error: e.message });
   }

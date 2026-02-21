@@ -2,7 +2,19 @@
 const config = require('./config');
 const { listLsrProductIds, fetchProduct } = require('./lsrClient');
 const { parseLsrProduct, parseLsrProductToObservations } = require('./lsrParser');
-const { lsrPointInAlertGeometry, insertLsrMatch, upsertLsrObservations, runSetBasedLsrMatch, updateAlertLsrSummary } = require('./db');
+const {
+  lsrPointInAlertGeometry,
+  insertLsrMatch,
+  upsertLsrObservations,
+  runSetBasedLsrMatch,
+  runSetBasedLsrMatchForAlerts,
+  updateAlertLsrSummary,
+  getAlertsDueForLsrRecheck,
+  updateLsrRecheckAttempts,
+  markLsrMatchedAndExpired,
+  getAlertLsrSummaries,
+  updateTriageForSystemOwnedAlerts,
+} = require('./db');
 const log = require('./logger');
 
 const LSR_FETCH_CONCURRENCY = Math.min(10, Math.max(5, parseInt(process.env.LSR_FETCH_CONCURRENCY, 10) || 8));
@@ -167,4 +179,116 @@ async function runLsrPipeline() {
   };
 }
 
-module.exports = { enrichAlertWithLsr, enrichWithLsr, runLsrPipeline };
+/**
+ * Recheck LSR matching for alerts in awaiting state (due by recheck interval).
+ * Fetches LSR products, upserts observations, runs set-based match for due alert_ids only,
+ * updates summaries, marks matched/expired, bumps recheck attempts, updates triage for system-owned.
+ * @returns {Promise<{ alerts: number, matched_now: number, duration_ms: number }>}
+ */
+async function runLsrRecheckLoop() {
+  const start = Date.now();
+  const dueIds = await getAlertsDueForLsrRecheck(config.lsrRecheckEveryMinutes ?? 10);
+  if (dueIds.length === 0) {
+    return { alerts: 0, matched_now: 0, duration_ms: Date.now() - start };
+  }
+
+  let productIds = [];
+  try {
+    const list = await listLsrProductIds();
+    productIds = list.map((p) => p.id).filter(Boolean);
+  } catch (err) {
+    log.errorMsg('LSR recheck list failed: ' + (err && err.message));
+    return { alerts: dueIds.length, matched_now: 0, duration_ms: Date.now() - start };
+  }
+
+  const products = [];
+  for (let i = 0; i < productIds.length; i += LSR_FETCH_CONCURRENCY) {
+    const chunk = productIds.slice(i, i + LSR_FETCH_CONCURRENCY);
+    const results = await Promise.all(
+      chunk.map(async (id) => {
+        try {
+          const p = await fetchProduct(id);
+          if (p && (p.productText || '').trim()) return p;
+        } catch (_) {}
+        return null;
+      })
+    );
+    products.push(...results.filter(Boolean));
+  }
+
+  const allObservations = [];
+  for (const prod of products) {
+    const issued = prod.issuanceTime || null;
+    const wfo = null;
+    const rows = parseLsrProductToObservations(prod.productText, prod.productId, issued, wfo);
+    allObservations.push(...rows);
+  }
+
+  if (allObservations.length > 0) {
+    await upsertLsrObservations(allObservations);
+  }
+
+  const bufferHours = config.alertLsrTimeBufferHours ?? 2;
+  const distanceMeters = config.alertLsrDistanceMeters ?? 30000;
+  await runSetBasedLsrMatchForAlerts(dueIds, bufferHours, distanceMeters);
+  await updateAlertLsrSummary();
+  await markLsrMatchedAndExpired();
+  await updateLsrRecheckAttempts(dueIds);
+  await updateTriageForSystemOwnedAlerts();
+
+  const summaries = await getAlertLsrSummaries(dueIds);
+  const matched_now = (summaries || []).filter((s) => (s.lsr_match_count || 0) > 0).length;
+  const duration_ms = Date.now() - start;
+  if (typeof process !== 'undefined' && process.stdout) process.stdout.write('[LSR RECHECK] alerts=' + dueIds.length + ' matched_now=' + matched_now + ' duration_ms=' + duration_ms + '\n');
+  return { alerts: dueIds.length, matched_now, duration_ms };
+}
+
+/**
+ * One-off LSR recheck for a single alert (e.g. from POST /v1/alerts/:id/lsr-recheck).
+ * Fetches LSR products, upserts observations, runs match for this alert_id, updates summary and hold state.
+ * Caller should call getAlertById after to return updated alert; caller updates triage if system-owned.
+ * @param {string} alertId
+ * @returns {Promise<{ matched: number }>} matched = new matches inserted
+ */
+async function runLsrRecheckForAlert(alertId) {
+  if (!alertId) return { matched: 0 };
+  let productIds = [];
+  try {
+    const list = await listLsrProductIds();
+    productIds = list.map((p) => p.id).filter(Boolean);
+  } catch (err) {
+    log.errorMsg('LSR recheck list failed: ' + (err && err.message));
+    return { matched: 0 };
+  }
+  const products = [];
+  for (let i = 0; i < productIds.length; i += LSR_FETCH_CONCURRENCY) {
+    const chunk = productIds.slice(i, i + LSR_FETCH_CONCURRENCY);
+    const results = await Promise.all(
+      chunk.map(async (id) => {
+        try {
+          const p = await fetchProduct(id);
+          if (p && (p.productText || '').trim()) return p;
+        } catch (_) {}
+        return null;
+      })
+    );
+    products.push(...results.filter(Boolean));
+  }
+  const allObservations = [];
+  for (const prod of products) {
+    const issued = prod.issuanceTime || null;
+    const wfo = null;
+    const rows = parseLsrProductToObservations(prod.productText, prod.productId, issued, wfo);
+    allObservations.push(...rows);
+  }
+  if (allObservations.length > 0) await upsertLsrObservations(allObservations);
+  const bufferHours = config.alertLsrTimeBufferHours ?? 2;
+  const distanceMeters = config.alertLsrDistanceMeters ?? 30000;
+  const matchResult = await runSetBasedLsrMatchForAlerts([alertId], bufferHours, distanceMeters);
+  await updateAlertLsrSummary();
+  await markLsrMatchedAndExpired();
+  await updateLsrRecheckAttempts([alertId]);
+  return { matched: matchResult.inserted ?? 0 };
+}
+
+module.exports = { enrichAlertWithLsr, enrichWithLsr, runLsrPipeline, runLsrRecheckLoop, runLsrRecheckForAlert };

@@ -131,7 +131,7 @@ At 15-minute intervals you get ~96 rows/day; retention is up to you (e.g. drop r
 
 - **npm run nws:once** – One ingest cycle then exit. Logs one line per actionable alert (with derived ZIPs when geometry present) and a JSON summary.
 - **npm run nws:poll** – Poll every NWS_POLL_SECONDS until SIGINT/SIGTERM.
-- **npm run test** – Run unit tests (PostGIS param handling, parameterized SQL).
+- **npm run test** – Run unit and API tests (db, lsrParser, thresholds, dashboard, sort, triage, api, triage-api).
 
 ## Testing (all test methods)
 
@@ -139,7 +139,12 @@ These are the test commands baked into the codebase. Use them to validate each p
 
 | Command | What it does | What it validates |
 |--------|----------------|-------------------|
-| **npm run test** | Runs Node `--test` on `db.test.js` and `lsrParser.test.js` | PostGIS ZIP query uses `$1` only; Polygon/MultiPolygon param building; LSR point-in-polygon SQL uses `$1,$2,$3`; regex parser for hail and wind lines. No DB or network. |
+| **npm run test** | Runs Node `--test` on db, lsrParser, thresholds, dashboard, sort, triage, api, triage-api test files | PostGIS params; LSR parser; thresholds/damage_score; dashboard order-by; triage rules and API; alerts API contract. Some tests need `DATABASE_URL`; triage-api skips write tests if migration 014 not applied. |
+| **npm run test:triage** | Runs Node `--test` on `triage.test.js` | Pure unit tests for `computeTriage()` and `actionToStatus()`: warning+interesting→actionable, monitoring reasons, confidence levels. No DB or network. |
+| **npm run test:triage-api** | Runs Node `--test` on `triage-api.test.js` | Triage filters (`triage_status`, `work_queue`), `buildAlertsOrderBy` work_queue, `updateAlertTriage`/audit, reset_to_system. Requires `DATABASE_URL`; write tests skip if triage columns missing (migration 014). |
+| **npm run test:lsr-hold** | Runs Node `--test` on `lsr-hold.test.js` | LSR hold start: only warning+geom+no LSR get awaiting; watch/geom missing never get hold. Skips if migration 015 not applied. |
+| **npm run test:lsr-recheck** | Runs Node `--test` on `lsr-recheck.test.js` | Recheck scheduling (due-by-interval), runSetBasedLsrMatchForAlerts, markLsrMatchedAndExpired. Requires `DATABASE_URL`. |
+| **npm run test:lsr-ui** | Runs Node `--test` on `lsr-ui.test.js` | LSR recheck API contract (alert has lsr_status, lsr_hold_until); UI helpers (countdown, Awaiting LSR display). |
 | **npm run nws:test-zips** | Sends fixed GeoJSON polygons (Houston, Dallas) to PostGIS, prints returned ZIPs | ZCTA intersection: `getZipsByGeometry` and `zcta5_raw` work; SRID handling. Requires `DATABASE_URL` and `zcta5_raw` populated. |
 | **npm run nws:test-lsr** | Fetches recent LSR products from NWS, parses hail/wind/points, prints counts and samples; if DB has an alert with geometry, runs point-in-polygon and reports inserts | LSR API fetch; LSR parser (hail, wind, lat/lon); optional DB match + insert into `nws_alert_lsr`. Requires network; DB optional for full match step. |
 | **npm run nws:once** | Full ingest: fetch alerts → filter → upsert `nws_alerts` → derive ZIPs → upsert `alert_impacted_zips` → LSR enrichment → log summary JSON | End-to-end: NWS alerts, chunked states, activation filter, ZIP derivation, LSR fetch/parse/match. Check final JSON for `lsr_products_fetched`, `lsr_entries_parsed`, `lsr_matches_inserted`, etc. |
@@ -147,7 +152,7 @@ These are the test commands baked into the codebase. Use them to validate each p
 
 **Script locations**
 
-- Unit tests: `services/nws-ingestor/db.test.js`, `services/nws-ingestor/lsrParser.test.js`
+- Unit tests: `services/nws-ingestor/db.test.js`, `services/nws-ingestor/lsrParser.test.js`, `services/nws-ingestor/thresholds.test.js`, `services/nws-ingestor/dashboard.test.js`, `services/nws-ingestor/sort.test.js`, `services/nws-ingestor/triage.test.js`, `services/nws-ingestor/api.test.js`, `services/nws-ingestor/triage-api.test.js`, `services/nws-ingestor/lsr-hold.test.js`, `services/nws-ingestor/lsr-recheck.test.js`, `services/nws-ingestor/lsr-ui.test.js`
 - ZIP test script: `services/nws-ingestor/scripts/test-zip-lookup.js`
 - LSR test script: `services/nws-ingestor/scripts/test-lsr-enrichment.js`
 

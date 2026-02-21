@@ -58,6 +58,10 @@ module.exports = {
   dryRun: process.env.DRY_RUN === 'true' || process.env.DRY_RUN === '1',
   lsrLookbackHours: Math.max(1, parseInt(process.env.LSR_LOOKBACK_HOURS, 10) || 48),
   lsrTimeSlopHours: Math.max(0, parseInt(process.env.LSR_TIME_SLOP_HOURS, 10) || 2),
+  /** Max minutes to hold a warning (geom, no LSR) before marking expired. */
+  lsrHoldMaxMinutes: Math.max(1, parseInt(process.env.LSR_HOLD_MAX_MINUTES, 10) || 60),
+  /** Recheck LSR matching every N minutes for alerts in awaiting state. */
+  lsrRecheckEveryMinutes: Math.max(1, parseInt(process.env.LSR_RECHECK_EVERY_MINUTES, 10) || 10),
   /** Hours before effective and after expires for LSR time window (warnings). */
   alertLsrTimeBufferHours: Math.max(0, parseInt(process.env.ALERT_LSR_TIME_BUFFER_HOURS, 10) || 2),
   /** Max distance (meters) for ST_DWithin match when geom present. */

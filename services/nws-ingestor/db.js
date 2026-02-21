@@ -447,6 +447,69 @@ async function runSetBasedLsrMatch(bufferHours, distanceMeters) {
 }
 
 /**
+ * Set-based LSR match restricted to given alert_ids (for recheck). Same logic as runSetBasedLsrMatch.
+ * @param {string[]} alertIds
+ * @param {number} bufferHours
+ * @param {number} distanceMeters
+ * @returns {Promise<{ inserted: number }>}
+ */
+async function runSetBasedLsrMatchForAlerts(alertIds, bufferHours, distanceMeters) {
+  if (!alertIds || alertIds.length === 0) return { inserted: 0 };
+  const sql = `
+    WITH warnings AS (
+      SELECT
+        n.id AS alert_id,
+        n.effective,
+        n.expires,
+        n.geometry_json,
+        COALESCE(p.impacted_states, '{}') AS impacted_states
+      FROM public.nws_alerts n
+      JOIN public.alert_impacted_zips p ON p.alert_id = n.id
+      WHERE (n.event LIKE '% Warning')
+        AND n.geometry_json IS NOT NULL
+        AND n.expires > now() - interval '1 day'
+        AND n.id = ANY($3::text[])
+    ),
+    alert_geoms AS (
+      SELECT
+        alert_id,
+        effective,
+        expires,
+        impacted_states,
+        ST_SetSRID(ST_GeomFromGeoJSON(geometry_json::text), 4326) AS geom
+      FROM warnings
+    ),
+    candidates AS (
+      SELECT
+        a.alert_id,
+        o.observation_id,
+        a.geom AS alert_geom,
+        o.geom AS obs_geom
+      FROM alert_geoms a
+      CROSS JOIN public.nws_lsr_observations o
+      WHERE o.geom IS NOT NULL
+        AND o.occurred_at IS NOT NULL
+        AND o.occurred_at BETWEEN a.effective - ($1::numeric || ' hours')::interval
+          AND a.expires + ($1::numeric || ' hours')::interval
+        AND (a.impacted_states = '{}' OR o.state = ANY(a.impacted_states))
+        AND (ST_Contains(a.geom, o.geom)
+             OR ST_DWithin(a.geom::geography, o.geom::geography, $2))
+    )
+    INSERT INTO public.nws_alert_lsr_matches (alert_id, observation_id, match_method, distance_meters, match_confidence)
+    SELECT
+      c.alert_id,
+      c.observation_id,
+      CASE WHEN ST_Contains(c.alert_geom, c.obs_geom) THEN 'contains' ELSE 'dwithin' END,
+      CASE WHEN NOT ST_Contains(c.alert_geom, c.obs_geom) THEN ST_Distance(c.alert_geom::geography, c.obs_geom::geography)::numeric ELSE NULL END,
+      CASE WHEN ST_Contains(c.alert_geom, c.obs_geom) THEN 'high' ELSE 'medium' END
+    FROM candidates c
+    ON CONFLICT (alert_id, observation_id) DO NOTHING
+  `;
+  const result = await pool.query(sql, [bufferHours, distanceMeters, alertIds]);
+  return { inserted: result.rowCount ?? 0 };
+}
+
+/**
  * Update alert_impacted_zips LSR summary columns from nws_alert_lsr_matches + nws_lsr_observations.
  */
 async function updateAlertLsrSummary() {
@@ -489,6 +552,78 @@ async function updateAlertLsrSummary() {
     WHERE p.alert_id = a.alert_id
   `;
   await pool.query(sql);
+}
+
+/**
+ * Start LSR hold for warnings with geometry, no LSR, and not yet expired.
+ * Sets lsr_status='awaiting', lsr_hold_until=min(expires, now()+holdMaxMinutes), lsr_last_checked_at=now(), lsr_check_attempts=1.
+ * Only when current lsr_status is 'none' (first detection). Does not change triage.
+ * @param {number} holdMaxMinutes - LSR_HOLD_MAX_MINUTES
+ */
+async function startLsrHoldForEligibleAlerts(holdMaxMinutes) {
+  const interval = Math.max(1, holdMaxMinutes);
+  await pool.query(
+    `UPDATE public.alert_impacted_zips SET
+       lsr_status = 'awaiting',
+       lsr_hold_until = CASE WHEN expires IS NULL THEN now() + ($1::numeric || ' minutes')::interval ELSE LEAST(expires, now() + ($1::numeric || ' minutes')::interval) END,
+       lsr_last_checked_at = now(),
+       lsr_check_attempts = 1
+     WHERE COALESCE(alert_class, 'other') = 'warning'
+       AND geom_present = true
+       AND (expires IS NULL OR expires > now())
+       AND COALESCE(lsr_match_count, 0) = 0
+       AND COALESCE(lsr_status, 'none') = 'none'`,
+    [interval]
+  );
+}
+
+/**
+ * Mark awaiting alerts as matched (lsr_match_count>0) or expired (now()>=hold_until or now()>=expires).
+ * Call after updateAlertLsrSummary so lsr_match_count is current.
+ */
+async function markLsrMatchedAndExpired() {
+  await pool.query(
+    `UPDATE public.alert_impacted_zips SET lsr_status = 'matched', lsr_hold_until = NULL
+     WHERE lsr_status = 'awaiting' AND COALESCE(lsr_match_count, 0) > 0`
+  );
+  await pool.query(
+    `UPDATE public.alert_impacted_zips SET lsr_status = 'expired', lsr_hold_until = NULL
+     WHERE lsr_status = 'awaiting'
+       AND ((lsr_hold_until IS NOT NULL AND now() >= lsr_hold_until) OR (expires IS NOT NULL AND now() >= expires))`
+  );
+}
+
+/**
+ * Get alert_ids due for LSR recheck: lsr_status='awaiting', now()<lsr_hold_until, now()<expires, and last_checked past recheck interval.
+ * @param {number} recheckEveryMinutes
+ * @returns {Promise<string[]>}
+ */
+async function getAlertsDueForLsrRecheck(recheckEveryMinutes) {
+  const min = Math.max(1, recheckEveryMinutes);
+  const { rows } = await pool.query(
+    `SELECT alert_id FROM public.alert_impacted_zips
+     WHERE COALESCE(lsr_status, 'none') = 'awaiting'
+       AND (lsr_hold_until IS NULL OR now() < lsr_hold_until)
+       AND (expires IS NULL OR now() < expires)
+       AND (lsr_last_checked_at IS NULL OR lsr_last_checked_at <= now() - ($1::numeric || ' minutes')::interval)`,
+    [min]
+  );
+  return (rows || []).map((r) => r.alert_id);
+}
+
+/**
+ * Update lsr_last_checked_at and lsr_check_attempts for given alert_ids after a recheck run.
+ * @param {string[]} alertIds
+ */
+async function updateLsrRecheckAttempts(alertIds) {
+  if (!alertIds || alertIds.length === 0) return;
+  await pool.query(
+    `UPDATE public.alert_impacted_zips SET
+       lsr_last_checked_at = now(),
+       lsr_check_attempts = COALESCE(lsr_check_attempts, 0) + 1
+     WHERE alert_id = ANY($1::text[])`,
+    [alertIds]
+  );
 }
 
 /**
@@ -1313,7 +1448,12 @@ module.exports = {
   upsertAlertImpactedZips,
   upsertLsrObservations,
   runSetBasedLsrMatch,
+  runSetBasedLsrMatchForAlerts,
   updateAlertLsrSummary,
+  startLsrHoldForEligibleAlerts,
+  markLsrMatchedAndExpired,
+  getAlertsDueForLsrRecheck,
+  updateLsrRecheckAttempts,
   updateAlertThresholdsAndScore,
   updateTriageForSystemOwnedAlerts,
   insertTriageAudit,

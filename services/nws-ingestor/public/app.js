@@ -600,6 +600,17 @@
       var triageClass = ['actionable', 'monitoring', 'sent_manual', 'suppressed', 'new'].indexOf(triageStatus) >= 0 ? triageStatus : 'new';
       var conf = (a.confidence_level || 'low').toLowerCase();
       var triageCell = '<span class="triage-pill ' + triageClass + '">' + escapeHtml(triageStatus) + '</span> <span class="confidence-' + conf + '" title="Confidence">' + escapeHtml(conf) + '</span>';
+      var lsrStatus = (a.lsr_status || 'none').toLowerCase();
+      var lsrStatusClass = ['awaiting', 'matched', 'expired', 'none'].indexOf(lsrStatus) >= 0 ? lsrStatus : 'none';
+      var holdLabel = '';
+      if (lsrStatus === 'awaiting' && a.lsr_hold_until) {
+        var holdMs = new Date(a.lsr_hold_until).getTime() - Date.now();
+        if (holdMs > 0) {
+          var holdMin = Math.floor(holdMs / 60000);
+          holdLabel = ' Hold: ' + holdMin + 'm left';
+        }
+      }
+      var lsrStatusCell = '<span class="lsr-status-pill ' + lsrStatusClass + '">' + (lsrStatus === 'awaiting' ? 'Awaiting LSR' : escapeHtml(lsrStatus)) + '</span>' + (holdLabel ? '<span style="margin-left:0.25rem;color:#a1a1aa;font-size:0.75rem">' + escapeHtml(holdLabel) + '</span>' : '');
       var badges = [];
       if (a.interesting_hail) badges.push('<span class="badge hail">HAIL 1.25+</span>');
       if (a.interesting_wind) badges.push('<span class="badge wind">WIND 70+</span>');
@@ -617,6 +628,7 @@
         '<td>' + densityCell + '</td>' +
         '<td>' + escapeHtml(expiresIn) + '</td>' +
         '<td>' + Number(lsrCount) + '</td>' +
+        '<td>' + lsrStatusCell + '</td>' +
         '<td>' + Number(score) + '</td>' +
         '<td>' + triageCell + '</td>' +
         '<td>' + badges.join('') + '</td>' +
@@ -636,7 +648,7 @@
     updateSortIndicators();
     if (alerts.length === 0) {
       var empty = document.createElement('tr');
-      empty.innerHTML = '<td colspan="13">No alerts. Run "Run ingest once" or adjust filters.</td>';
+      empty.innerHTML = '<td colspan="14">No alerts. Run "Run ingest once" or adjust filters.</td>';
       tbody.appendChild(empty);
     }
   }
@@ -719,6 +731,18 @@
       whyHtml +
       '<p><strong>Copy block</strong></p><div class="copy-block" id="copy-block">' + buildCopyBlock(alert).replace(/</g, '&lt;').replace(/>/g, '&gt;') + '</div>';
     document.getElementById('detail-content').innerHTML = html;
+    var lsrStatusEl = document.getElementById('detail-lsr-status');
+    if (lsrStatusEl) {
+      var lsrSt = (alert.lsr_status || 'none').toLowerCase();
+      var lastChecked = alert.lsr_last_checked_at ? new Date(alert.lsr_last_checked_at).toLocaleString() : '—';
+      var attempts = alert.lsr_check_attempts != null ? alert.lsr_check_attempts : 0;
+      var holdUntil = alert.lsr_hold_until ? new Date(alert.lsr_hold_until).toLocaleString() : '—';
+      lsrStatusEl.innerHTML = '<p style="margin-bottom:0.5rem;"><strong>LSR status</strong></p>' +
+        '<table style="font-size:0.875rem;"><tr><td>Status</td><td><span class="lsr-status-pill ' + (['awaiting', 'matched', 'expired', 'none'].indexOf(lsrSt) >= 0 ? lsrSt : 'none') + '">' + (lsrSt === 'awaiting' ? 'Awaiting LSR' : escapeHtml(lsrSt)) + '</span></td></tr>' +
+        '<tr><td>Last checked</td><td>' + escapeHtml(lastChecked) + '</td></tr>' +
+        '<tr><td>Attempts</td><td>' + attempts + '</td></tr>' +
+        '<tr><td>Hold until</td><td>' + escapeHtml(holdUntil) + '</td></tr></table>';
+    }
     var triageActionsEl = document.getElementById('detail-triage-actions');
     triageActionsEl.innerHTML =
       '<p style="margin-bottom:0.5rem;"><strong>Triage</strong></p>' +
@@ -778,6 +802,23 @@
       document.getElementById('detail-message').innerHTML = '<div class="alert error">' + e.message + '</div>';
     }
   });
+
+  var recheckLsrBtn = document.getElementById('detail-recheck-lsr-btn');
+  if (recheckLsrBtn) {
+    recheckLsrBtn.addEventListener('click', async function () {
+      if (!currentAlert || !currentAlert.alert_id) return;
+      var msgEl = document.getElementById('detail-message');
+      try {
+        msgEl.innerHTML = '<div class="alert" style="background:#27272a;">Rechecking LSR...</div>';
+        await api('/v1/alerts/' + encodeURIComponent(currentAlert.alert_id) + '/lsr-recheck', { method: 'POST' });
+        if (window.showCopyFeedback) window.showCopyFeedback('LSR recheck done.');
+        else msgEl.innerHTML = '<div class="alert success">LSR recheck done.</div>';
+        openDetail(currentAlert.alert_id, detailBackToPage === 'map');
+      } catch (e) {
+        msgEl.innerHTML = '<div class="alert error">' + escapeHtml(e.message) + '</div>';
+      }
+    });
+  }
 
   document.getElementById('detail-back').addEventListener('click', (e) => {
     e.preventDefault();
