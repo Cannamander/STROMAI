@@ -116,6 +116,11 @@ function normalizeFeature(feature) {
 
   const states = statesFromGeocode(props);
   const location = locationFromProps(props);
+  const geocode = props.geocode;
+  const affectedZones = props.affectedZones ?? props.affected_zones;
+  const ugcArray = geocode && (geocode.UGC || geocode.ugc);
+  const affected_zones_count = Array.isArray(affectedZones) ? affectedZones.length : 0;
+  const ugc_count = Array.isArray(ugcArray) ? ugcArray.length : 0;
 
   return {
     id: String(id).trim(),
@@ -137,6 +142,9 @@ function normalizeFeature(feature) {
     ends,
     geometry_json: feature.geometry ?? null,
     raw_json: feature,
+    /** From NWS properties: length of affectedZones and geocode.UGC (for geo diagnostics). */
+    affected_zones_count,
+    ugc_count,
   };
 }
 

@@ -1,0 +1,15 @@
+{
+  "type": "Feature",
+  "id": "https://api.weather.gov/alerts/urn:oid:2.49.0.1.840.0.test-null-geom",
+  "properties": {
+    "id": "https://api.weather.gov/alerts/urn:oid:2.49.0.1.840.0.test-null-geom",
+    "event": "Flash Flood Watch",
+    "severity": "Moderate",
+    "sent": "2025-02-18T17:00:00+00:00",
+    "effective": "2025-02-18T17:00:00+00:00",
+    "expires": "2025-02-19T06:00:00+00:00",
+    "affectedZones": ["https://api.weather.gov/zones/forecast/LAZ001"],
+    "geocode": { "UGC": ["LAC001", "LAZ001"] }
+  },
+  "geometry": null
+}

@@ -12,6 +12,7 @@
     "test:db": "node --test services/nws-ingestor/db.test.js",
     "test:dashboard": "node --test services/nws-ingestor/dashboard.test.js",
     "test:api": "node --test services/nws-ingestor/api.test.js",
+    "test:geo": "node --test services/nws-ingestor/geo.test.js",
     "nws:test-zips": "node services/nws-ingestor/scripts/test-zip-lookup.js",
     "nws:test-lsr": "node services/nws-ingestor/scripts/test-lsr-enrichment.js",
     "nws:test-lsr-pipeline": "node services/nws-ingestor/scripts/test-lsr-pipeline.js",

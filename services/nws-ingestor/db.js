@@ -198,9 +198,10 @@ async function insertUgcZips(ugc, zips) {
 const IMPACT_UPSERT_SQL = `
   INSERT INTO public.alert_impacted_zips (
     alert_id, event, headline, severity, sent, effective, expires, geom_present, zips,
-    impacted_states, zip_count, alert_class, area_sq_miles, zip_density, geo_method, zip_inference_method
+    impacted_states, zip_count, alert_class, area_sq_miles, zip_density, geo_method, zip_inference_method,
+    affected_zones_count, ugc_count
   )
-  VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16)
+  VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18)
   ON CONFLICT (alert_id) DO UPDATE SET
     zips = EXCLUDED.zips,
     expires = EXCLUDED.expires,
@@ -213,12 +214,14 @@ const IMPACT_UPSERT_SQL = `
     area_sq_miles = EXCLUDED.area_sq_miles,
     zip_density = EXCLUDED.zip_density,
     geo_method = EXCLUDED.geo_method,
-    zip_inference_method = EXCLUDED.zip_inference_method
+    zip_inference_method = EXCLUDED.zip_inference_method,
+    affected_zones_count = EXCLUDED.affected_zones_count,
+    ugc_count = EXCLUDED.ugc_count
 `;
 
 /**
  * Upsert one row into alert_impacted_zips.
- * @param {object} row - { id, event, headline, severity, sent, effective, expires, geom_present, zips, impacted_states, alert_class?, area_sq_miles?, zip_density?, geo_method?, zip_inference_method? }
+ * @param {object} row - { id, event, ..., affected_zones_count?, ugc_count? }
  * @returns {Promise<'insert'|'update'>}
  */
 async function upsertAlertImpactedZipsRow(row) {
@@ -246,6 +249,8 @@ async function upsertAlertImpactedZipsRow(row) {
     row.zip_density ?? null,
     row.geo_method ?? 'unknown',
     row.zip_inference_method ?? 'none',
+    row.affected_zones_count != null ? Number(row.affected_zones_count) : 0,
+    row.ugc_count != null ? Number(row.ugc_count) : 0,
   ]);
   return existing.rows.length > 0 ? 'update' : 'insert';
 }

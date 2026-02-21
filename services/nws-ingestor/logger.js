@@ -95,7 +95,24 @@ function alertLine(opts) {
     'lsr=' + lsr,
   ];
   if (upsert) parts.push('|', 'upsert=' + upsert);
+  const zipInference = safe(opts.zip_inference);
+  if (zipInference && geom === 'N') parts.push('|', 'zip_inference=' + zipInference);
   console.log(parts.join(' '));
+}
+
+/**
+ * Debug-only: one [GEO] diagnostic line per alert (first N per run). Confirms geometry presence and zone counts.
+ * Never prints raw payloads.
+ * @param {object} opts - event, geom (boolean Y/N), ugc (count), affectedZones (count), areaDesc (string, first 60 chars used)
+ */
+function geoLine(opts) {
+  if (!isDebug()) return;
+  const event = safe(opts.event) || '—';
+  const geom = opts.geom === true || opts.geom === 'Y' ? 'Y' : 'N';
+  const ugc = opts.ugc != null ? Number(opts.ugc) : 0;
+  const affectedZones = opts.affectedZones != null ? Number(opts.affectedZones) : 0;
+  const areaDesc = safe(opts.areaDesc) ? String(opts.areaDesc).slice(0, 60) : '—';
+  console.log('[GEO] event=' + event + ' geom=' + geom + ' ugc=' + ugc + ' affectedZones=' + affectedZones + ' areaDesc=' + areaDesc);
 }
 
 /**
@@ -276,6 +293,7 @@ function debugLine(msg) {
 module.exports = {
   runHeader,
   alertLine,
+  geoLine,
   lsrSummaryLine,
   alertStateLine,
   alertDetailsDebug,

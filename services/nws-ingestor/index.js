@@ -139,6 +139,20 @@ async function ingestOnce(opts = {}) {
       actionableKept: actionable_count,
     });
 
+    if (log.isDebug() && withFutureExpires.length > 0) {
+      const geoN = Math.min(5, withFutureExpires.length);
+      for (let i = 0; i < geoN; i++) {
+        const row = withFutureExpires[i];
+        log.geoLine({
+          event: row.event,
+          geom: row.geometry_json != null,
+          ugc: row.ugc_count ?? 0,
+          affectedZones: row.affected_zones_count ?? 0,
+          areaDesc: (row.area_desc || '').slice(0, 60),
+        });
+      }
+    }
+
     if (config.dryRun) {
       timings.total_ms = Date.now() - start;
       log.runSummary(
@@ -228,6 +242,8 @@ async function ingestOnce(opts = {}) {
           zip_density,
           geo_method,
           zip_inference_method,
+          affected_zones_count: row.affected_zones_count ?? 0,
+          ugc_count: row.ugc_count ?? 0,
         };
       })
     );
@@ -267,6 +283,7 @@ async function ingestOnce(opts = {}) {
         zipsCount: (row.zips || []).length,
         lsr: lsrCount,
         upsert,
+        zip_inference: !row.geom_present ? 'unavailable(geom_null)' : undefined,
       });
       if (isWarning(alertRow || row) && lsrSummary && (lsrSummary.lsr_match_count || 0) > 0 && log.isDebug()) {
         log.lsrSummaryLine({
