@@ -39,10 +39,12 @@ function deriveGeoMethod(geom_present, ugcCodes) {
  * Derive zip_inference_method.
  * @param {boolean} geom_present
  * @param {number} zip_count
- * @returns {'polygon_intersect'|'none'}
+ * @param {boolean} [textNarrowed] - when true, ZIPs were narrowed from UGC using NWS text place names
+ * @returns {'polygon_intersect'|'text_narrowed'|'none'}
  */
-function deriveZipInferenceMethod(geom_present, zip_count) {
+function deriveZipInferenceMethod(geom_present, zip_count, textNarrowed) {
   if (geom_present && (zip_count ?? 0) > 0) return 'polygon_intersect';
+  if (textNarrowed && (zip_count ?? 0) > 0) return 'text_narrowed';
   return 'none';
 }
 

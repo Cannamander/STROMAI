@@ -6,11 +6,12 @@
  */
 require('dotenv').config();
 const express = require('express');
-const { getAlerts, getAlertById, updateAlertTriage, insertTriageAudit, getTriageAudit, enqueueDelivery, getOutbox, getOutboxById, getOutboxByState, updateOutboxRow, cancelOutboxRow, getStateSummary, getStatePlaces, getMapAlerts, getMapZips, getMapMeta, setLastIngestRun } = require('./db');
+const { getAlerts, getAlertById, getAlertNwsStatement, getAlertsByIds, updateAlertTriage, insertTriageAudit, getTriageAudit, enqueueDelivery, enqueueDeliveryOnce, getOutbox, getOutboxById, getOutboxByState, updateOutboxRow, cancelOutboxRow, getStateSummary, getStatePlaces, getMapAlerts, getMapZips, getMapMeta, setLastIngestRun, getClients, getClientById, createClient, updateClient, getClientConfig, putClientConfig, getOperatorPrefs, setOperatorPrefs, getAlertsForClient, getAlertsForClientQueue } = require('./db');
 const { buildDeliveryPayload } = require('./payloadBuilder');
 const { computeTriage, actionToStatus, TRIAGE_ACTIONS } = require('./triage');
 const { ingestOnce } = require('./index');
 const { runLsrRecheckForAlert } = require('./lsrEnrich');
+const config = require('./config');
 
 const path = require('path');
 const app = express();
@@ -123,6 +124,277 @@ app.get('/v1/alerts', async (req, res) => {
     });
     res.json({ alerts: rows });
   } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+const BULK_MAX = config.bulkMax ?? 200;
+
+// GET /v1/alerts/zips.csv?alert_ids=id1,id2,...&mode=per_alert|unique — bulk ZIP export (must be before /v1/alerts/:alert_id)
+app.get('/v1/alerts/zips.csv', async (req, res) => {
+  try {
+    const raw = req.query.alert_ids;
+    const mode = (req.query.mode || 'per_alert').toLowerCase();
+    if (!raw || typeof raw !== 'string') return res.status(400).json({ error: 'alert_ids required (comma-separated)' });
+    const alertIds = raw.split(',').map((s) => s.trim()).filter(Boolean);
+    if (alertIds.length === 0) return res.status(400).json({ error: 'alert_ids required' });
+    if (alertIds.length > BULK_MAX) return res.status(400).json({ error: 'alert_ids exceeds BULK_MAX (' + BULK_MAX + ')' });
+    const alerts = await getAlertsByIds(alertIds);
+    if (mode === 'unique') {
+      const set = new Set();
+      for (const a of alerts) for (const z of (a.zips || [])) set.add(z);
+      const zips = [...set].sort();
+      res.setHeader('Content-Type', 'text/csv');
+      res.setHeader('Content-Disposition', 'attachment; filename="alerts-unique-zips.csv"');
+      res.send('zip\n' + zips.join('\n'));
+    } else {
+      res.setHeader('Content-Type', 'text/csv');
+      res.setHeader('Content-Disposition', 'attachment; filename="alerts-zips.csv"');
+      const lines = ['alert_id,zip'];
+      for (const a of alerts) for (const z of (a.zips || [])) lines.push(a.alert_id + ',' + z);
+      res.send(lines.join('\n'));
+    }
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// POST /v1/alerts/triage/bulk — bulk triage update
+app.post('/v1/alerts/triage/bulk', async (req, res) => {
+  try {
+    const body = req.body || {};
+    let alertIds = Array.isArray(body.alert_ids) ? body.alert_ids : [];
+    alertIds = alertIds.map((id) => String(id).trim()).filter(Boolean);
+    if (alertIds.length === 0) return res.status(400).json({ error: 'alert_ids required (array)' });
+    if (alertIds.length > BULK_MAX) return res.status(400).json({ error: 'alert_ids exceeds BULK_MAX (' + BULK_MAX + ')' });
+    const action = body.action && String(body.action).toLowerCase();
+    if (!action || !TRIAGE_ACTIONS.has(action)) return res.status(400).json({ error: 'action required: set_actionable, set_monitoring, set_suppressed, set_sent_manual, or reset_to_system' });
+    const note = body.note != null ? String(body.note) : null;
+    const actor = req.user && (req.user.email || req.user.id);
+    const failed = [];
+    const updated_alerts = [];
+    const client = await require('./db').pool.connect();
+    try {
+      await client.query('BEGIN');
+      for (const alertId of alertIds) {
+        try {
+          const alert = (await client.query('SELECT * FROM public.alert_impacted_zips WHERE alert_id = $1', [alertId])).rows[0];
+          if (!alert) { failed.push({ alert_id: alertId, error: 'Alert not found' }); continue; }
+          const prevStatus = alert.triage_status || 'new';
+          if (action === 'reset_to_system') {
+            const { status, reasons, confidence_level } = computeTriage(alert);
+            await client.query(
+              `UPDATE public.alert_impacted_zips SET triage_status = $1, triage_status_source = 'system', triage_reasons = $2, confidence_level = $3, triage_status_updated_at = now(), triage_status_updated_by = NULL WHERE alert_id = $4`,
+              [status, reasons, confidence_level, alertId]
+            );
+            await client.query(
+              `INSERT INTO public.nws_triage_audit (alert_id, actor, action, prev_status, new_status, note) VALUES ($1, $2, $3, $4, $5, $6)`,
+              [alertId, actor, action, prevStatus, status, note]
+            );
+            updated_alerts.push({ alert_id: alertId, triage_status: status, triage_status_source: 'system', triage_status_updated_at: new Date().toISOString() });
+          } else {
+            const newStatus = actionToStatus(action);
+            if (!newStatus) { failed.push({ alert_id: alertId, error: 'Invalid action' }); continue; }
+            await client.query(
+              `UPDATE public.alert_impacted_zips SET triage_status = $1, triage_status_source = 'operator', triage_status_updated_at = now(), triage_status_updated_by = $2 WHERE alert_id = $3`,
+              [newStatus, actor, alertId]
+            );
+            await client.query(
+              `INSERT INTO public.nws_triage_audit (alert_id, actor, action, prev_status, new_status, note) VALUES ($1, $2, $3, $4, $5, $6)`,
+              [alertId, actor, action, prevStatus, newStatus, note]
+            );
+            updated_alerts.push({ alert_id: alertId, triage_status: newStatus, triage_status_source: 'operator', triage_status_updated_at: new Date().toISOString() });
+          }
+        } catch (err) {
+          failed.push({ alert_id: alertId, error: err.message });
+        }
+      }
+      await client.query('COMMIT');
+    } catch (e) {
+      await client.query('ROLLBACK').catch(() => {});
+      throw e;
+    } finally {
+      client.release();
+    }
+    const updated_count = updated_alerts.length;
+    if (typeof process !== 'undefined' && process.stdout) process.stdout.write('[BULK] action=triage selected=' + alertIds.length + ' success=' + updated_count + ' failed=' + failed.length + '\n');
+    res.json({ updated_count, failed, updated_alerts });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// POST /v1/deliveries/bulk — bulk queue (no send)
+app.post('/v1/deliveries/bulk', async (req, res) => {
+  try {
+    const body = req.body || {};
+    let alertIds = Array.isArray(body.alert_ids) ? body.alert_ids : [];
+    alertIds = alertIds.map((id) => String(id).trim()).filter(Boolean);
+    if (alertIds.length === 0) return res.status(400).json({ error: 'alert_ids required (array)' });
+    if (alertIds.length > BULK_MAX) return res.status(400).json({ error: 'alert_ids exceeds BULK_MAX (' + BULK_MAX + ')' });
+    const destination = body.destination || 'property_enrichment_v1';
+    const mode = (body.mode || 'queue').toLowerCase();
+    if (mode !== 'dry_run' && mode !== 'queue') return res.status(400).json({ error: 'mode must be dry_run or queue' });
+    if (mode === 'dry_run') {
+      const alerts = await getAlertsByIds(alertIds);
+      const payloads = alerts.map((a) => ({ alert_id: a.alert_id, payload: buildDeliveryPayload(a, 1) }));
+      return res.json({ mode: 'dry_run', count: payloads.length, payloads });
+    }
+    let queued_count = 0;
+    let duplicates_count = 0;
+    const failed = [];
+    for (const alertId of alertIds) {
+      try {
+        const alert = await getAlertById(alertId);
+        if (!alert) { failed.push({ alert_id: alertId, error: 'Alert not found' }); continue; }
+        const payload = buildDeliveryPayload(alert, 1);
+        const { inserted } = await enqueueDeliveryOnce({ destination, alert_id: alertId, payload_version: 1, payload }, alert.zips || []);
+        if (inserted) queued_count++; else duplicates_count++;
+      } catch (err) {
+        failed.push({ alert_id: alertId, error: err.message });
+      }
+    }
+    if (typeof process !== 'undefined' && process.stdout) process.stdout.write('[BULK] action=delivery selected=' + alertIds.length + ' success=' + queued_count + ' duplicates=' + duplicates_count + ' failed=' + failed.length + '\n');
+    res.json({ queued_count, duplicates_count, failed });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// ---------- Clients ----------
+// GET /v1/clients (active only by default)
+app.get('/v1/clients', async (req, res) => {
+  try {
+    const activeOnly = req.query.active !== 'false';
+    const rows = await getClients(activeOnly);
+    res.json({ clients: rows });
+  } catch (e) {
+    if (e.code === '42P01') return res.status(501).json({ error: 'Clients table not migrated. Run migration 016_clients_territories_thresholds.sql' });
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// POST /v1/clients { name }
+app.post('/v1/clients', async (req, res) => {
+  try {
+    const name = (req.body && req.body.name) ? String(req.body.name).trim() : '';
+    if (!name) return res.status(400).json({ error: 'name required' });
+    const client = await createClient(name);
+    res.status(201).json(client);
+  } catch (e) {
+    if (e.code === '42P01') return res.status(501).json({ error: 'Clients table not migrated' });
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// PATCH /v1/clients/:id { name?, is_active? }
+app.patch('/v1/clients/:id', async (req, res) => {
+  try {
+    const id = req.params.id;
+    const client = await getClientById(id);
+    if (!client) return res.status(404).json({ error: 'Client not found' });
+    const updated = await updateClient(id, req.body || {});
+    res.json(updated);
+  } catch (e) {
+    if (e.code === '42P01') return res.status(501).json({ error: 'Clients table not migrated' });
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// GET /v1/clients/:id/config
+app.get('/v1/clients/:id/config', async (req, res) => {
+  try {
+    const configObj = await getClientConfig(req.params.id);
+    if (!configObj) return res.status(404).json({ error: 'Client not found' });
+    res.json(configObj);
+  } catch (e) {
+    if (e.code === '42P01') return res.status(501).json({ error: 'Clients table not migrated' });
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// PUT /v1/clients/:id/config { territory?, thresholds? }
+app.put('/v1/clients/:id/config', async (req, res) => {
+  try {
+    const configObj = await putClientConfig(req.params.id, req.body || {});
+    if (!configObj) return res.status(404).json({ error: 'Client not found' });
+    res.json(configObj);
+  } catch (e) {
+    if (e.code === '42P01') return res.status(501).json({ error: 'Clients table not migrated' });
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// GET /v1/clients/:id/alerts — same query params as /v1/alerts, territory + client thresholds applied
+app.get('/v1/clients/:id/alerts', async (req, res) => {
+  try {
+    const clientId = req.params.id;
+    const client = await getClientById(clientId);
+    if (!client) return res.status(404).json({ error: 'Client not found' });
+    const active = req.query.active === 'true';
+    const min_score = req.query.min_score != null ? Number(req.query.min_score) : undefined;
+    const max_score = req.query.max_score != null ? Number(req.query.max_score) : undefined;
+    const state = req.query.state || undefined;
+    const interesting = req.query.interesting;
+    const class_ = req.query.class;
+    const geom_present = req.query.geom_present;
+    const lsr_present = req.query.lsr_present;
+    const min_zip_count = req.query.min_zip_count != null ? Number(req.query.min_zip_count) : undefined;
+    const max_zip_count = req.query.max_zip_count != null ? Number(req.query.max_zip_count) : undefined;
+    const max_area_sq_miles = req.query.max_area_sq_miles != null ? Number(req.query.max_area_sq_miles) : undefined;
+    const sort_mode = req.query.sort_mode || (req.query.work_queue === 'true' ? 'work_queue' : undefined);
+    const sort_by = req.query.sort_by || undefined;
+    const sort_dir = req.query.sort_dir || undefined;
+    const work_queue = req.query.work_queue === 'true';
+    const triage_status = req.query.triage_status || undefined;
+    const since_last_ingest = req.query.since_last_ingest !== 'false';
+    let rows = await getAlertsForClient(clientId, {
+      active,
+      since_last_ingest,
+      min_score,
+      max_score,
+      state,
+      interesting: interesting === 'true' ? true : interesting === 'false' ? false : undefined,
+      class: class_,
+      geom_present: geom_present === 'true' ? true : geom_present === 'false' ? false : undefined,
+      lsr_present: lsr_present === 'true' ? true : lsr_present === 'false' ? false : undefined,
+      min_zip_count,
+      max_zip_count,
+      max_area_sq_miles,
+      sort_mode,
+      sort_by,
+      sort_dir,
+      work_queue,
+      triage_status,
+    });
+    // Add client_relevance: HIGH / MED / LOW from interesting_any_for_client + confidence_level
+    const conf = (r) => (r.confidence_level || 'low').toLowerCase();
+    rows = rows.map((r) => ({
+      ...r,
+      client_relevance: (r.interesting_any_for_client && conf(r) === 'high') ? 'HIGH' : (r.interesting_any_for_client || conf(r) === 'high' || conf(r) === 'medium') ? 'MED' : 'LOW',
+    }));
+    res.json({ alerts: rows });
+  } catch (e) {
+    if (e.code === '42P01') return res.status(501).json({ error: 'Clients table not migrated' });
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// GET /v1/clients/:id/queue — actionable + monitoring, Action Priority sort
+app.get('/v1/clients/:id/queue', async (req, res) => {
+  try {
+    const clientId = req.params.id;
+    const client = await getClientById(clientId);
+    if (!client) return res.status(404).json({ error: 'Client not found' });
+    let rows = await getAlertsForClientQueue(clientId);
+    const conf = (r) => (r.confidence_level || 'low').toLowerCase();
+    rows = rows.map((r) => ({
+      ...r,
+      client_relevance: (r.interesting_any_for_client && conf(r) === 'high') ? 'HIGH' : (r.interesting_any_for_client || conf(r) === 'high' || conf(r) === 'medium') ? 'MED' : 'LOW',
+    }));
+    res.json({ alerts: rows });
+  } catch (e) {
+    if (e.code === '42P01') return res.status(501).json({ error: 'Clients table not migrated' });
     res.status(500).json({ error: e.message });
   }
 });
@@ -267,12 +539,19 @@ app.get('/v1/map/zips', async (req, res) => {
   }
 });
 
-// GET /v1/alerts/:alert_id
+// GET /v1/alerts/:alert_id — includes description and instruction from NWS raw_json when available
 app.get('/v1/alerts/:alert_id', async (req, res) => {
   try {
     const alert = await getAlertById(req.params.alert_id);
     if (!alert) return res.status(404).json({ error: 'Alert not found' });
-    res.json(alert);
+    let description = null;
+    let instruction = null;
+    try {
+      const st = await getAlertNwsStatement(req.params.alert_id);
+      description = st.description;
+      instruction = st.instruction;
+    } catch (_) { /* nws_alerts may be missing or no raw_json */ }
+    res.json({ ...alert, description, instruction });
   } catch (e) {
     res.status(500).json({ error: e.message });
   }

@@ -92,6 +92,24 @@
     .leaflet-popup-content { margin: 0.5rem; font-size: 0.875rem; max-width: 360px; }
     .map-popup-headline { display: block; font-weight: normal; color: #a1a1aa; font-size: 0.8rem; margin: 0.2rem 0; }
     .map-polygon-tooltip { white-space: normal; max-width: 320px; font-size: 0.8rem; }
+    .bulk-action-bar { position: sticky; top: 0; z-index: 50; background: #18181b; border: 1px solid #27272a; border-radius: 6px; padding: 0.5rem 0.75rem; margin-bottom: 0.5rem; display: flex; flex-wrap: wrap; align-items: center; gap: 0.5rem; }
+    .bulk-action-bar button, .bulk-action-bar .btn { margin: 0; }
+    .bulk-msg { font-size: 0.8rem; color: #a1a1aa; margin: 0.25rem 0; }
+    .bulk-col { width: 2.5rem; }
+    .client-header-strip { background: #27272a; border-radius: 6px; padding: 0.5rem 0.75rem; margin-bottom: 0.5rem; display: flex; flex-wrap: wrap; align-items: center; gap: 0.5rem; }
+    .client-header-strip .client-thresholds-summary { color: #a1a1aa; font-size: 0.875rem; margin-left: 0.5rem; }
+    .client-territory-pill { display: inline-block; padding: 0.2rem 0.5rem; margin: 0.1rem; border-radius: 4px; background: #3f3f46; color: #e4e4e7; font-size: 0.8rem; }
+    .client-relevance-high { color: #22c55e; }
+    .client-relevance-med { color: #eab308; }
+    .client-relevance-low { color: #71717a; }
+    .modal-overlay { position: fixed; top: 0; left: 0; right: 0; bottom: 0; background: rgba(0,0,0,0.5); z-index: 200; display: none; }
+    .modal-overlay.open { display: block; }
+    .modal-panel { position: fixed; top: 50%; left: 50%; transform: translate(-50%, -50%); background: #18181b; border: 1px solid #27272a; border-radius: 8px; padding: 1.25rem; min-width: 360px; max-width: 90vw; z-index: 201; max-height: 90vh; overflow: auto; }
+    .modal-panel h3 { margin: 0 0 1rem 0; font-size: 1.1rem; }
+    .modal-panel label { display: block; margin-top: 0.5rem; font-size: 0.875rem; }
+    .modal-panel input[type="text"], .modal-panel input[type="number"], .modal-panel select { width: 100%; margin-top: 0.25rem; }
+    .modal-panel .modal-actions { margin-top: 1rem; display: flex; gap: 0.5rem; }
+    .drawer-territory-banner { background: #78350f; color: #fde68a; padding: 0.5rem 0.75rem; border-radius: 6px; margin-bottom: 0.5rem; font-size: 0.875rem; }
   </style>
   <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css" />
   <link rel="stylesheet" href="https://unpkg.com/leaflet.markercluster@1.5.3/dist/MarkerCluster.css" />
@@ -99,6 +117,12 @@
 </head>
 <body>
   <h1>AI-STORMS Operator</h1>
+  <div id="client-selector-wrap" style="display:none; margin-bottom: 0.5rem;">
+    <label>Client:</label>
+    <select id="client-select">
+      <option value="">All Clients</option>
+    </select>
+  </div>
   <div id="login-section" style="display:none;">
     <p>Sign in to continue.</p>
     <input type="email" id="login-email" placeholder="Email" />
@@ -112,6 +136,12 @@
     <a href="#" data-page="outbox">Outbox</a>
     <button id="logout-btn">Logout</button>
   </nav>
+
+  <div id="client-header-strip" class="client-header-strip" style="display:none;">
+    <span id="client-territory-pills"></span>
+    <span id="client-thresholds-summary" class="client-thresholds-summary"></span>
+    <button type="button" id="client-edit-config-btn" class="btn">Edit Client Config</button>
+  </div>
 
   <section id="dashboard" class="active">
     <p>
@@ -153,8 +183,23 @@
       <button type="button" id="filter-clear-state">Clear state</button>
       <button id="filter-apply">Apply</button>
     </div>
+    <div id="bulk-bar" class="bulk-action-bar" style="display:none;">
+      <span id="bulk-selected-count">Selected: 0</span>
+      <button type="button" id="bulk-action-actionable">Mark Actionable</button>
+      <button type="button" id="bulk-action-monitoring">Mark Monitoring</button>
+      <button type="button" id="bulk-action-suppress">Suppress</button>
+      <button type="button" id="bulk-action-sent">Mark Sent (Manual)</button>
+      <button type="button" id="bulk-action-reset">Reset to System</button>
+      <button type="button" id="bulk-action-queue">Queue Delivery</button>
+      <label><input type="radio" name="bulk-zip-mode" value="per_alert" checked /> Per-alert ZIPs</label>
+      <label><input type="radio" name="bulk-zip-mode" value="unique" /> Unique ZIPs</label>
+      <button type="button" id="bulk-export-zips" class="btn">Export ZIPs (CSV)</button>
+      <button type="button" id="bulk-copy-summary">Copy Summary</button>
+    </div>
+    <p id="bulk-selection-cleared-msg" class="bulk-msg" style="display:none;"></p>
     <table id="alerts-table">
       <thead><tr>
+        <th class="bulk-col"><input type="checkbox" id="alerts-select-all" title="Select all on this page" /></th>
         <th class="sortable" data-sort="event">Event <span class="sort-indicator"></span></th>
         <th>States</th>
         <th class="sortable" data-sort="zip_count">ZIPs <span class="sort-indicator"></span></th>
@@ -235,6 +280,26 @@
     </table>
   </section>
 
+  <div id="client-config-modal-overlay" class="modal-overlay" aria-hidden="true"></div>
+  <div id="client-config-modal" class="modal-panel" style="display:none;" aria-hidden="true">
+    <h3>Edit Client Config</h3>
+    <label>Name</label>
+    <input type="text" id="client-config-name" placeholder="Client name" />
+    <label>States (comma-separated, e.g. TX, OK, LA)</label>
+    <input type="text" id="client-config-states" placeholder="TX, OK" />
+    <label>Hail min (inches)</label>
+    <input type="number" id="client-config-hail" min="0" step="0.25" value="1.25" />
+    <label>Wind min (mph)</label>
+    <input type="number" id="client-config-wind" min="0" value="70" />
+    <label><input type="checkbox" id="client-config-rare-freeze" checked /> Rare freeze enabled</label>
+    <label>Rare freeze states (comma-separated)</label>
+    <input type="text" id="client-config-rare-freeze-states" placeholder="TX" value="TX" />
+    <div class="modal-actions">
+      <button type="button" id="client-config-save" class="primary">Save</button>
+      <button type="button" id="client-config-cancel">Cancel</button>
+    </div>
+  </div>
+
   <div id="state-drawer-overlay" class="drawer-overlay" aria-hidden="true"></div>
   <div id="state-drawer-panel" class="drawer-panel" aria-hidden="true" style="display:none;">
     <div class="drawer-header">
@@ -248,6 +313,7 @@
       <button type="button" data-drawer-tab="outbox">Outbox (State)</button>
     </div>
     <div class="drawer-body">
+      <div id="drawer-territory-banner" class="drawer-territory-banner" style="display:none;">Outside client territory</div>
       <div id="drawer-tab-overview" class="tab-pane">
         <div id="drawer-summary-tiles" class="summary-tiles"></div>
         <p><strong>Top events</strong></p>

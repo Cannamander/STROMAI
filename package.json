@@ -6,7 +6,7 @@
     "migrate": "node services/nws-ingestor/scripts/run-migrations.js",
     "nws:once": "node services/nws-ingestor/index.js once",
     "nws:poll": "node services/nws-ingestor/index.js poll",
-    "test": "node --test services/nws-ingestor/db.test.js services/nws-ingestor/lsrParser.test.js services/nws-ingestor/thresholds.test.js services/nws-ingestor/dashboard.test.js services/nws-ingestor/sort.test.js services/nws-ingestor/triage.test.js services/nws-ingestor/api.test.js services/nws-ingestor/triage-api.test.js services/nws-ingestor/lsr-hold.test.js services/nws-ingestor/lsr-recheck.test.js services/nws-ingestor/lsr-ui.test.js",
+    "test": "node --test services/nws-ingestor/db.test.js services/nws-ingestor/lsrParser.test.js services/nws-ingestor/thresholds.test.js services/nws-ingestor/dashboard.test.js services/nws-ingestor/sort.test.js services/nws-ingestor/triage.test.js services/nws-ingestor/api.test.js services/nws-ingestor/triage-api.test.js services/nws-ingestor/lsr-hold.test.js services/nws-ingestor/lsr-recheck.test.js services/nws-ingestor/lsr-ui.test.js services/nws-ingestor/bulk-api.test.js services/nws-ingestor/bulk-ui.test.js services/nws-ingestor/clients-api.test.js services/nws-ingestor/clients-ui.test.js",
     "test:unit": "node --test services/nws-ingestor/db.test.js services/nws-ingestor/lsrParser.test.js services/nws-ingestor/thresholds.test.js services/nws-ingestor/dashboard.test.js services/nws-ingestor/sort.test.js",
     "test:lsr": "node --test services/nws-ingestor/lsrParser.test.js",
     "test:thresholds": "node --test services/nws-ingestor/thresholds.test.js",
@@ -28,7 +28,13 @@
     "test:map-api": "node --test services/nws-ingestor/map-api.test.js",
     "test:lsr-hold": "node --test services/nws-ingestor/lsr-hold.test.js",
     "test:lsr-recheck": "node --test services/nws-ingestor/lsr-recheck.test.js",
-    "test:lsr-ui": "node --test services/nws-ingestor/lsr-ui.test.js"
+    "test:lsr-ui": "node --test services/nws-ingestor/lsr-ui.test.js",
+    "test:bulk": "node --test services/nws-ingestor/bulk-api.test.js services/nws-ingestor/bulk-ui.test.js",
+    "test:bulk-api": "node --test services/nws-ingestor/bulk-api.test.js",
+    "test:bulk-ui": "node --test services/nws-ingestor/bulk-ui.test.js",
+    "test:clients": "node --test services/nws-ingestor/clients-api.test.js services/nws-ingestor/clients-ui.test.js",
+    "test:clients-api": "node --test services/nws-ingestor/clients-api.test.js",
+    "test:clients-ui": "node --test services/nws-ingestor/clients-ui.test.js"
   },
   "dependencies": {
     "dotenv": "^16.3.1",

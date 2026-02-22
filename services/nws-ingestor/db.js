@@ -652,14 +652,70 @@ const FREEZE_EVENT_NAMES = [
 ];
 
 /**
+ * Update text_hail_inches, text_wind_mph, text_damage_keywords on alert_impacted_zips from nws_alerts.raw_json.
+ * Call before updateAlertThresholdsAndScore so score can use LSR or text-derived values.
+ */
+async function updateTextSignalsFromNwsAlerts() {
+  const { rows } = await pool.query(
+    `SELECT n.id, n.raw_json FROM public.nws_alerts n
+     INNER JOIN public.alert_impacted_zips p ON p.alert_id = n.id
+     WHERE n.raw_json IS NOT NULL`
+  );
+  const { extractSignalsFromText } = require('./descriptionSignals');
+  for (const row of rows) {
+    const raw = row.raw_json;
+    const props = (raw && raw.properties) || raw || {};
+    const headline = props.headline != null ? String(props.headline) : '';
+    const description = props.description != null ? String(props.description) : '';
+    const instruction = props.instruction != null ? String(props.instruction) : '';
+    const signals = extractSignalsFromText({ headline, description, instruction });
+    await pool.query(
+      `UPDATE public.alert_impacted_zips SET
+         text_hail_inches = $1, text_wind_mph = $2, text_damage_keywords = $3
+       WHERE alert_id = $4`,
+      [
+        signals.hail_inches,
+        signals.wind_mph != null ? Math.max(0, Math.min(999, Math.round(signals.wind_mph))) : null,
+        Math.max(0, Math.min(100, signals.damage_keyword_count)),
+        row.id,
+      ]
+    );
+  }
+}
+
+/**
  * Update all alert_impacted_zips with threshold flags and damage_score (set-based).
- * @param {number} hailInches - INTERESTING_HAIL_INCHES
- * @param {number} windMph - INTERESTING_WIND_MPH
- * @param {string[]} freezeRareStates - FREEZE_RARE_STATES
- * @param {string[]} freezeEventNames - Freeze event names
+ * Uses LSR values when present, otherwise text-derived (text_hail_inches, text_wind_mph) when migration 017 applied.
+ * Adds up to 20 points for text_damage_keywords when available.
  */
 async function updateAlertThresholdsAndScore(hailInches, windMph, freezeRareStates, freezeEventNames) {
-  const sql = `
+  const params = [hailInches, windMph, freezeEventNames || FREEZE_EVENT_NAMES, freezeRareStates || []];
+  const sqlWithText = `
+    UPDATE public.alert_impacted_zips p SET
+      interesting_hail = (
+        (COALESCE(p.hail_max_inches, p.text_hail_inches) IS NOT NULL)
+        AND (COALESCE(p.hail_max_inches, p.text_hail_inches) >= $1)
+      ),
+      interesting_wind = (
+        (COALESCE(p.wind_max_mph, p.text_wind_mph) IS NOT NULL)
+        AND (COALESCE(p.wind_max_mph, p.text_wind_mph) >= $2)
+      ),
+      interesting_rare_freeze = (p.event = ANY($3::text[]) AND p.impacted_states && $4::text[]),
+      interesting_any = (
+        (COALESCE(p.hail_max_inches, p.text_hail_inches) IS NOT NULL AND COALESCE(p.hail_max_inches, p.text_hail_inches) >= $1) OR
+        (COALESCE(p.wind_max_mph, p.text_wind_mph) IS NOT NULL AND COALESCE(p.wind_max_mph, p.text_wind_mph) >= $2) OR
+        (p.event = ANY($3::text[]) AND p.impacted_states && $4::text[])
+      ),
+      damage_score = LEAST(100, GREATEST(0,
+        (CASE WHEN p.event LIKE '% Warning' THEN 50 WHEN p.event LIKE '% Watch' THEN 10 ELSE 0 END) +
+        (CASE WHEN COALESCE(p.hail_max_inches, p.text_hail_inches) IS NOT NULL AND COALESCE(p.hail_max_inches, p.text_hail_inches) >= $1 THEN 40 ELSE 0 END) +
+        (CASE WHEN COALESCE(p.wind_max_mph, p.text_wind_mph) IS NOT NULL AND COALESCE(p.wind_max_mph, p.text_wind_mph) >= $2 THEN 30 ELSE 0 END) +
+        (CASE WHEN p.event = ANY($3::text[]) AND p.impacted_states && $4::text[] THEN 35 ELSE 0 END) +
+        (CASE WHEN COALESCE(p.tornado_count, 0) > 0 THEN 40 ELSE 0 END) +
+        (CASE WHEN COALESCE(p.text_damage_keywords, 0) > 0 THEN LEAST(20, COALESCE(p.text_damage_keywords, 0) * 5) ELSE 0 END)
+      ))
+  `;
+  const sqlLsrOnly = `
     UPDATE public.alert_impacted_zips p SET
       interesting_hail = (p.hail_max_inches IS NOT NULL AND p.hail_max_inches >= $1),
       interesting_wind = (p.wind_max_mph IS NOT NULL AND p.wind_max_mph >= $2),
@@ -677,12 +733,12 @@ async function updateAlertThresholdsAndScore(hailInches, windMph, freezeRareStat
         (CASE WHEN COALESCE(p.tornado_count, 0) > 0 THEN 40 ELSE 0 END)
       ))
   `;
-  await pool.query(sql, [
-    hailInches,
-    windMph,
-    freezeEventNames || FREEZE_EVENT_NAMES,
-    freezeRareStates || [],
-  ]);
+  try {
+    await pool.query(sqlWithText, params);
+  } catch (e) {
+    if (e.code === '42703') await pool.query(sqlLsrOnly, params);
+    else throw e;
+  }
 }
 
 /**
@@ -769,6 +825,14 @@ const OUTBOX_INSERT_SQL = `
   RETURNING id, created_at, status, event_key, alert_id
 `;
 
+/** Same as OUTBOX_INSERT_SQL but ON CONFLICT DO NOTHING so we can detect duplicate. */
+const OUTBOX_INSERT_ONCE_SQL = `
+  INSERT INTO public.zip_delivery_outbox (status, destination, event_key, alert_id, payload_version, payload)
+  VALUES ($1, $2, $3, $4, $5, $6)
+  ON CONFLICT (event_key) DO NOTHING
+  RETURNING id
+`;
+
 /**
  * Enqueue a delivery (or get existing by event_key). Idempotent by event_key.
  * @param {object} params - { destination, alert_id, payload_version, payload }
@@ -786,6 +850,25 @@ async function enqueueDelivery(params, zips) {
     JSON.stringify(params.payload || {}),
   ]);
   return rows[0];
+}
+
+/**
+ * Enqueue a delivery only if event_key not present. Returns { inserted: boolean } for bulk duplicate counting.
+ * @param {object} params - { destination, alert_id, payload_version, payload }
+ * @param {string[]} zips - for event_key hash
+ * @returns {Promise<{ inserted: boolean }>}
+ */
+async function enqueueDeliveryOnce(params, zips) {
+  const eventKey = buildEventKey(params.alert_id, params.payload_version ?? 1, zips);
+  const { rows } = await pool.query(OUTBOX_INSERT_ONCE_SQL, [
+    'queued',
+    params.destination,
+    eventKey,
+    params.alert_id,
+    params.payload_version ?? 1,
+    JSON.stringify(params.payload || {}),
+  ]);
+  return { inserted: rows.length > 0 };
 }
 
 /**
@@ -841,6 +924,40 @@ async function getAlertById(alertId) {
     [alertId]
   );
   return rows[0] || null;
+}
+
+/**
+ * Get NWS plain text from raw_json (description, instruction) for an alert. Used for alert detail view.
+ * @param {string} alertId
+ * @returns {Promise<{ description: string|null, instruction: string|null }>}
+ */
+async function getAlertNwsStatement(alertId) {
+  const { rows } = await pool.query(
+    'SELECT raw_json FROM public.nws_alerts WHERE id = $1',
+    [alertId]
+  );
+  const raw = rows[0] && rows[0].raw_json;
+  if (!raw || typeof raw !== 'object') return { description: null, instruction: null };
+  const props = raw.properties || raw;
+  return {
+    description: (props.description != null && String(props.description).trim()) ? String(props.description).trim() : null,
+    instruction: (props.instruction != null && String(props.instruction).trim()) ? String(props.instruction).trim() : null,
+  };
+}
+
+/**
+ * Get multiple alerts by alert_ids. Returns rows in same order as input ids where found.
+ * @param {string[]} alertIds
+ * @returns {Promise<object[]>}
+ */
+async function getAlertsByIds(alertIds) {
+  if (!alertIds || alertIds.length === 0) return [];
+  const { rows } = await pool.query(
+    'SELECT * FROM public.alert_impacted_zips WHERE alert_id = ANY($1::text[])',
+    [alertIds]
+  );
+  const byId = new Map(rows.map((r) => [r.alert_id, r]));
+  return alertIds.map((id) => byId.get(id)).filter(Boolean);
 }
 
 /**
@@ -929,6 +1046,202 @@ async function setLastIngestRun() {
   await pool.query(
     'INSERT INTO public.last_ingest_run (id, updated_at) VALUES (1, now()) ON CONFLICT (id) DO UPDATE SET updated_at = now()'
   );
+}
+
+// ---------- Clients, territories, thresholds ----------
+async function getClients(activeOnly = true) {
+  const sql = activeOnly
+    ? "SELECT * FROM public.clients WHERE is_active = true ORDER BY name"
+    : "SELECT * FROM public.clients ORDER BY name";
+  const { rows } = await pool.query(sql);
+  return rows;
+}
+
+async function getClientById(clientId) {
+  const { rows } = await pool.query('SELECT * FROM public.clients WHERE client_id = $1', [clientId]);
+  return rows[0] || null;
+}
+
+async function createClient(name) {
+  const { rows } = await pool.query(
+    'INSERT INTO public.clients (name) VALUES ($1) RETURNING *',
+    [String(name).trim()]
+  );
+  const client = rows[0];
+  if (client) {
+    await pool.query('INSERT INTO public.client_territories (client_id, states) VALUES ($1, $2) ON CONFLICT (client_id) DO NOTHING', [client.client_id, []]);
+    await pool.query('INSERT INTO public.client_thresholds (client_id) VALUES ($1) ON CONFLICT (client_id) DO NOTHING', [client.client_id]);
+  }
+  return client;
+}
+
+async function updateClient(clientId, payload) {
+  const sets = [];
+  const values = [];
+  let i = 1;
+  if (payload.name !== undefined) { sets.push(`name = $${i++}`); values.push(String(payload.name).trim()); }
+  if (payload.is_active !== undefined) { sets.push(`is_active = $${i++}`); values.push(!!payload.is_active); }
+  if (sets.length === 0) return getClientById(clientId);
+  values.push(clientId);
+  await pool.query(`UPDATE public.clients SET ${sets.join(', ')} WHERE client_id = $${i}`, values);
+  return getClientById(clientId);
+}
+
+async function getClientConfig(clientId) {
+  const client = await getClientById(clientId);
+  if (!client) return null;
+  const [terr, th] = await Promise.all([
+    pool.query('SELECT * FROM public.client_territories WHERE client_id = $1', [clientId]).then((r) => r.rows[0] || null),
+    pool.query('SELECT * FROM public.client_thresholds WHERE client_id = $1', [clientId]).then((r) => r.rows[0] || null),
+  ]);
+  return {
+    client: { id: client.client_id, name: client.name },
+    territory: { states: (terr && terr.states) ? terr.states : [] },
+    thresholds: th ? {
+      hail_min_inches: Number(th.hail_min_inches),
+      wind_min_mph: Number(th.wind_min_mph),
+      rare_freeze_enabled: !!th.rare_freeze_enabled,
+      rare_freeze_states: Array.isArray(th.rare_freeze_states) ? th.rare_freeze_states : ['TX'],
+    } : { hail_min_inches: 1.25, wind_min_mph: 70, rare_freeze_enabled: true, rare_freeze_states: ['TX'] },
+  };
+}
+
+async function putClientConfig(clientId, payload) {
+  const client = await getClientById(clientId);
+  if (!client) return null;
+  if (payload.name !== undefined) {
+    await pool.query('UPDATE public.clients SET name = $1 WHERE client_id = $2', [String(payload.name).trim(), clientId]);
+  }
+  if (payload.territory && payload.territory.states) {
+    const states = Array.isArray(payload.territory.states) ? payload.territory.states.map((s) => String(s).trim().toUpperCase()).filter(Boolean) : [];
+    await pool.query(
+      'INSERT INTO public.client_territories (client_id, states, updated_at) VALUES ($1, $2, now()) ON CONFLICT (client_id) DO UPDATE SET states = $2, updated_at = now()',
+      [clientId, states]
+    );
+  }
+  if (payload.thresholds) {
+    const th = payload.thresholds;
+    const hail = th.hail_min_inches != null ? Number(th.hail_min_inches) : 1.25;
+    const wind = th.wind_min_mph != null ? Math.max(0, parseInt(th.wind_min_mph, 10)) : 70;
+    const rareFreeze = th.rare_freeze_enabled !== false;
+    const rareStates = Array.isArray(th.rare_freeze_states) ? th.rare_freeze_states.map((s) => String(s).trim().toUpperCase()).filter(Boolean) : ['TX'];
+    await pool.query(
+      `INSERT INTO public.client_thresholds (client_id, hail_min_inches, wind_min_mph, rare_freeze_enabled, rare_freeze_states, updated_at)
+       VALUES ($1, $2, $3, $4, $5, now())
+       ON CONFLICT (client_id) DO UPDATE SET hail_min_inches = $2, wind_min_mph = $3, rare_freeze_enabled = $4, rare_freeze_states = $5, updated_at = now()`,
+      [clientId, hail, wind, rareFreeze, rareStates]
+    );
+  }
+  return getClientConfig(clientId);
+}
+
+async function getOperatorPrefs(actor) {
+  const { rows } = await pool.query('SELECT * FROM public.operator_prefs WHERE actor = $1', [actor]);
+  return rows[0] || null;
+}
+
+async function setOperatorPrefs(actor, payload) {
+  await pool.query(
+    `INSERT INTO public.operator_prefs (actor, default_client_id, updated_at) VALUES ($1, $2, now())
+     ON CONFLICT (actor) DO UPDATE SET default_client_id = $2, updated_at = now()`,
+    [actor, payload.default_client_id || null]
+  );
+  return getOperatorPrefs(actor);
+}
+
+/**
+ * Client-scoped alerts: same filters as getAlerts but restricted to territory (impacted_states && territory.states)
+ * and adds interesting_any_for_client, badges_for_client using client thresholds (computed at query time).
+ */
+async function getAlertsForClient(clientId, filters = {}) {
+  const conditions = [];
+  const params = [clientId];
+  let i = 2;
+  conditions.push('p.impacted_states && t.states');
+  if (filters.active === true) {
+    conditions.push('(p.expires IS NULL OR p.expires > now())');
+  }
+  if (filters.state && String(filters.state).trim()) {
+    conditions.push(`p.impacted_states @> ARRAY[$${i++}]::text[]`);
+    params.push(String(filters.state).trim().toUpperCase());
+  }
+  const classVal = filters.class && String(filters.class).toLowerCase();
+  if (['warning', 'watch', 'advisory', 'statement', 'other'].includes(classVal)) {
+    conditions.push(`COALESCE(p.alert_class, 'other') = $${i++}`);
+    params.push(classVal);
+  }
+  if (filters.min_score != null && !Number.isNaN(Number(filters.min_score))) {
+    conditions.push(`COALESCE(p.damage_score, 0) >= $${i++}`);
+    params.push(Number(filters.min_score));
+  }
+  if (filters.max_score != null && !Number.isNaN(Number(filters.max_score))) {
+    conditions.push(`COALESCE(p.damage_score, 0) <= $${i++}`);
+    params.push(Number(filters.max_score));
+  }
+  if (filters.interesting === true) {
+    conditions.push('( (p.hail_max_inches >= th.hail_min_inches) OR (p.wind_max_mph >= th.wind_min_mph) OR (th.rare_freeze_enabled AND (p.event ILIKE \'%Freeze%\' OR p.event ILIKE \'%Frost%\') AND p.impacted_states && th.rare_freeze_states) )');
+  }
+  if (filters.interesting === false) {
+    conditions.push('NOT ( (p.hail_max_inches >= th.hail_min_inches) OR (p.wind_max_mph >= th.wind_min_mph) OR (th.rare_freeze_enabled AND (p.event ILIKE \'%Freeze%\' OR p.event ILIKE \'%Frost%\') AND p.impacted_states && th.rare_freeze_states) )');
+  }
+  if (filters.geom_present === true) conditions.push('p.geom_present = true');
+  if (filters.geom_present === false) conditions.push('p.geom_present = false');
+  if (filters.lsr_present === true) conditions.push('COALESCE(p.lsr_match_count, 0) > 0');
+  if (filters.lsr_present === false) conditions.push('(p.lsr_match_count IS NULL OR p.lsr_match_count = 0)');
+  if (filters.min_zip_count != null && !Number.isNaN(Number(filters.min_zip_count))) {
+    conditions.push(`COALESCE(p.zip_count, 0) >= $${i++}`);
+    params.push(Number(filters.min_zip_count));
+  }
+  if (filters.max_zip_count != null && !Number.isNaN(Number(filters.max_zip_count))) {
+    conditions.push(`COALESCE(p.zip_count, 0) <= $${i++}`);
+    params.push(Number(filters.max_zip_count));
+  }
+  if (filters.max_area_sq_miles != null && !Number.isNaN(Number(filters.max_area_sq_miles))) {
+    conditions.push(`(p.area_sq_miles IS NULL OR p.area_sq_miles <= $${i++})`);
+    params.push(Number(filters.max_area_sq_miles));
+  }
+  if (filters.since_last_ingest === true) {
+    conditions.push('((SELECT updated_at FROM public.last_ingest_run WHERE id = 1 LIMIT 1) IS NULL OR p.last_seen_at >= (SELECT updated_at FROM public.last_ingest_run WHERE id = 1 LIMIT 1))');
+  }
+  const triageStatus = filters.triage_status && String(filters.triage_status).toLowerCase();
+  if (['new', 'monitoring', 'actionable', 'sent_manual', 'suppressed'].includes(triageStatus)) {
+    conditions.push(`COALESCE(p.triage_status, 'new') = $${i++}`);
+    params.push(triageStatus);
+  }
+  if (filters.work_queue === true) {
+    conditions.push("COALESCE(p.triage_status, 'new') IN ('actionable', 'monitoring')");
+  }
+  const where = ' WHERE ' + conditions.join(' AND ');
+  const orderBy = buildAlertsOrderBy(filters);
+  const clientInterestingExpr = '((p.hail_max_inches >= th.hail_min_inches) OR (p.wind_max_mph >= th.wind_min_mph) OR (th.rare_freeze_enabled AND (p.event ILIKE \'%Freeze%\' OR p.event ILIKE \'%Frost%\') AND p.impacted_states && th.rare_freeze_states))';
+  const orderByMapped = orderBy.replace(/interesting_any\s*=\s*true/g, clientInterestingExpr);
+  const sql = `
+    SELECT p.*,
+      (p.hail_max_inches >= th.hail_min_inches) AS interesting_hail_for_client,
+      (p.wind_max_mph >= th.wind_min_mph) AS interesting_wind_for_client,
+      (th.rare_freeze_enabled AND (p.event ILIKE '%Freeze%' OR p.event ILIKE '%Frost%') AND p.impacted_states && th.rare_freeze_states) AS interesting_rare_freeze_for_client
+    FROM public.alert_impacted_zips p
+    INNER JOIN public.client_territories t ON t.client_id = $1
+    INNER JOIN public.client_thresholds th ON th.client_id = $1
+    ${where} ORDER BY ${orderByMapped} LIMIT 500`;
+  const { rows } = await pool.query(sql, params);
+  return rows.map((r) => {
+    const h = !!r.interesting_hail_for_client;
+    const w = !!r.interesting_wind_for_client;
+    const rf = !!r.interesting_rare_freeze_for_client;
+    return {
+      ...r,
+      interesting_any_for_client: h || w || rf,
+      badges_for_client: [h && 'hail', w && 'wind', rf && 'rare_freeze'].filter(Boolean),
+    };
+  });
+}
+
+/**
+ * Client-scoped "Actionable Now" queue: triage in (actionable, monitoring), Action Priority sort.
+ */
+async function getAlertsForClientQueue(clientId) {
+  return getAlertsForClient(clientId, { sort_mode: 'action', work_queue: true });
 }
 
 /** Whitelist for column sort; maps to safe SQL expression. */
@@ -1454,6 +1767,7 @@ module.exports = {
   markLsrMatchedAndExpired,
   getAlertsDueForLsrRecheck,
   updateLsrRecheckAttempts,
+  updateTextSignalsFromNwsAlerts,
   updateAlertThresholdsAndScore,
   updateTriageForSystemOwnedAlerts,
   insertTriageAudit,
@@ -1462,12 +1776,15 @@ module.exports = {
   getAlertLsrSummaries,
   buildEventKey,
   enqueueDelivery,
+  enqueueDeliveryOnce,
   getOutbox,
   getOutboxById,
   getOutboxByState,
   updateOutboxRow,
   cancelOutboxRow,
   getAlertById,
+  getAlertNwsStatement,
+  getAlertsByIds,
   getAlerts,
   getAlertsByState,
   setLastIngestRun,
@@ -1480,6 +1797,16 @@ module.exports = {
   normalizePlaceKey,
   buildAlertsOrderBy,
   SORT_COLUMNS,
+  getClients,
+  getClientById,
+  createClient,
+  updateClient,
+  getClientConfig,
+  putClientConfig,
+  getOperatorPrefs,
+  setOperatorPrefs,
+  getAlertsForClient,
+  getAlertsForClientQueue,
   lsrPointInAlertGeometry,
   LSR_POINT_IN_GEOM_SQL,
   insertLsrMatch,

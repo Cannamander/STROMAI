@@ -79,4 +79,6 @@ module.exports = {
     .split(',')
     .map((s) => s.trim().toUpperCase())
     .filter(Boolean),
+  /** Max alert_ids per bulk request (triage, delivery, export). */
+  bulkMax: Math.min(500, Math.max(1, parseInt(process.env.BULK_MAX, 10) || 200)),
 };

@@ -3,8 +3,9 @@ const config = require('./config');
 const { fetchActiveAlerts } = require('./nwsClient');
 const { normalizeFeature } = require('./normalize');
 const { classifyAlert, isActionable } = require('./activation');
-const { upsertAlerts, getAreaSqMiles, getZipsByGeometry, getZipsByPoint, getZipsByUgc, insertUgcZips, upsertAlertImpactedZips, insertPollSnapshot, getAlertLsrSummaries, updateAlertThresholdsAndScore, updateTriageForSystemOwnedAlerts, markLsrMatchedAndExpired, startLsrHoldForEligibleAlerts, closePool } = require('./db');
+const { upsertAlerts, getAreaSqMiles, getZipsByGeometry, getZipsByPoint, getZipsByUgc, insertUgcZips, upsertAlertImpactedZips, insertPollSnapshot, getAlertLsrSummaries, updateTextSignalsFromNwsAlerts, updateAlertThresholdsAndScore, updateTriageForSystemOwnedAlerts, markLsrMatchedAndExpired, startLsrHoldForEligibleAlerts, closePool } = require('./db');
 const { deriveAlertClass, deriveGeoMethod, deriveZipInferenceMethod, computeZipDensity } = require('./alertClass');
+const { extractPlaceNames } = require('./locationFromText');
 const { FREEZE_EVENT_NAMES } = require('./thresholds');
 const { runLsrPipeline, runLsrRecheckLoop } = require('./lsrEnrich');
 const { fetchZoneGeometry } = require('./zoneClient');
@@ -217,6 +218,35 @@ async function ingestOnce(opts = {}) {
           const pt = await geocodeCityState(loc.city, loc.state);
           if (pt) zips = await getZipsByPoint(pt.lon, pt.lat);
         }
+        // When we have UGC-derived ZIPs but no geometry, narrow to ZIPs that contain places mentioned in NWS text
+        let textNarrowed = false;
+        if (!geom_present && zips.length > 0 && impacted_states.length > 0 && config.inferZipGeocode) {
+          const props = (row.raw_json && row.raw_json.properties) || {};
+          const headline = props.headline != null ? String(props.headline) : (row.headline ?? '');
+          const description = props.description != null ? String(props.description) : '';
+          const instruction = props.instruction != null ? String(props.instruction) : '';
+          const area_desc = row.area_desc != null ? String(row.area_desc) : '';
+          const places = extractPlaceNames({ headline, description, instruction, area_desc });
+          const ugcZipSet = new Set(zips);
+          const zipSetFromPlaces = new Set();
+          for (const place of places) {
+            for (const state of impacted_states) {
+              const pt = await geocodeCityState(place.trim(), state);
+              if (config.inferZipDelayMs > 0) await new Promise((r) => setTimeout(r, config.inferZipDelayMs));
+              if (pt) {
+                const placeZips = await getZipsByPoint(pt.lon, pt.lat);
+                placeZips.forEach((z) => {
+                  if (ugcZipSet.has(z)) zipSetFromPlaces.add(z);
+                });
+                break;
+              }
+            }
+          }
+          if (zipSetFromPlaces.size > 0) {
+            zips = [...zipSetFromPlaces];
+            textNarrowed = true;
+          }
+        }
         const zip_count = zips.length;
         let area_sq_miles = null;
         if (geom_present && row.geometry_json) {
@@ -224,7 +254,7 @@ async function ingestOnce(opts = {}) {
         }
         const alert_class = deriveAlertClass(row.event);
         const geo_method = deriveGeoMethod(geom_present, ugcs);
-        const zip_inference_method = deriveZipInferenceMethod(geom_present, zip_count);
+        const zip_inference_method = deriveZipInferenceMethod(geom_present, zip_count, textNarrowed);
         const zip_density = computeZipDensity(zip_count, area_sq_miles);
         return {
           id: row.id,
@@ -322,6 +352,14 @@ async function ingestOnce(opts = {}) {
       log.errorMsg('LSR hold start failed: ' + (holdErr && holdErr.message));
     }
 
+    try {
+      await updateTextSignalsFromNwsAlerts();
+    } catch (textErr) {
+      if (textErr && textErr.code !== '42703') {
+        errorsCount++;
+        log.errorMsg('Text signals update failed: ' + (textErr.message || textErr));
+      }
+    }
     try {
       await updateAlertThresholdsAndScore(
         config.interestingHailInches,

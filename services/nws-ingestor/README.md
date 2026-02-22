@@ -30,7 +30,7 @@ Polls NWS active alerts, filters to actionable warnings (and optionally watches)
 
 ## API and operator UI
 
-- **npm run api** – Starts HTTP API and serves operator UI from `services/nws-ingestor/public/`. Endpoints: `GET /v1/alerts`, `GET /v1/alerts/:id`, `GET /v1/alerts/:id/zips.csv`, `GET /v1/alerts/:id/payload`, `POST /v1/deliveries`, `GET /v1/outbox`, `POST /v1/outbox/:id/retry`, `POST /v1/outbox/:id/cancel`. Without SUPABASE_URL, requests are unauthenticated (dev).
+- **npm run api** – Starts HTTP API and serves operator UI from `services/nws-ingestor/public/`. Endpoints: `GET /v1/alerts`, `GET /v1/alerts/:id`, `GET /v1/alerts/zips.csv` (bulk), `GET /v1/alerts/:id/zips.csv`, `GET /v1/alerts/:id/payload`, `POST /v1/deliveries`, `POST /v1/deliveries/bulk`, `POST /v1/alerts/triage/bulk`, `GET /v1/clients`, `POST /v1/clients`, `PATCH /v1/clients/:id`, `GET /v1/clients/:id/config`, `PUT /v1/clients/:id/config`, `GET /v1/clients/:id/alerts` (territory + client thresholds), `GET /v1/clients/:id/queue`, `GET /v1/outbox`, `POST /v1/outbox/:id/retry`, `POST /v1/outbox/:id/cancel`. Without SUPABASE_URL, requests are unauthenticated (dev).
 - **npm run worker** – Polls `zip_delivery_outbox` for status=queued and sends via mock adapter (remote_job_id=mock). Set **WORKER_POLL_MS** to tune.
 
 ### Operator UI – how to use
@@ -68,6 +68,8 @@ When an alert has **state, city, and/or zone (UGC)** but no polygon, we can stil
    - Looking up **ugc_zips** (if the table is populated), or
    - **Fetching zone geometry** from `api.weather.gov/zones/forecast/{ugc}` (or `/zones/county/{ugc}` for county codes), then running the same PostGIS ZCTA intersection. Results are cached in **ugc_zips** for future runs. Run migration `004_ugc_zips.sql` so the cache table exists.
 2. **City + state** – If `INFER_ZIP_GEOCODE=true` and the alert has city and state, we geocode to a point (Nominatim) and return the ZCTA containing that point. One ZIP per city; rate-limited.
+
+3. **Text narrowing** – When we already have UGC-derived ZIPs (whole zone/county) and `INFER_ZIP_GEOCODE=true`, we parse NWS description/instruction/headline for place names (e.g. “Including the cities of X, Y, and Z”, “near X”) and geocode them. We then keep only ZIPs that both lie in the UGC set and contain at least one of those places, yielding a smaller, more precise set. The console shows `zip_inference_method=text_narrowed` when this was applied.
 
 The readout shows `zips=N (inferred)` when ZIPs came from UGC or geocode instead of polygon intersection.
 
@@ -108,8 +110,10 @@ psql "$DATABASE_URL" -f services/nws-ingestor/migrations/006_nws_lsr_observation
 psql "$DATABASE_URL" -f services/nws-ingestor/migrations/007_nws_alert_lsr_matches.sql
 psql "$DATABASE_URL" -f services/nws-ingestor/migrations/008_alert_thresholds_delivery_score.sql
 psql "$DATABASE_URL" -f services/nws-ingestor/migrations/009_zip_delivery_outbox.sql
+# ... through 015; then for client territories and thresholds:
+psql "$DATABASE_URL" -f services/nws-ingestor/migrations/016_clients_territories_thresholds.sql
 ```
-Then populate **ugc_zips** (UGC code → ZIP list) if you want ZIP inference when alerts have no geometry; see “Inferring ZIPs when NWS sends no geometry” above.
+Or run all in order: `npm run migrate`. Then populate **ugc_zips** (UGC code → ZIP list) if you want ZIP inference when alerts have no geometry; see “Inferring ZIPs when NWS sends no geometry” above.
 
 ## Using poll snapshots (map overlay, time windows, alerts)
 
@@ -139,12 +143,18 @@ These are the test commands baked into the codebase. Use them to validate each p
 
 | Command | What it does | What it validates |
 |--------|----------------|-------------------|
-| **npm run test** | Runs Node `--test` on db, lsrParser, thresholds, dashboard, sort, triage, api, triage-api test files | PostGIS params; LSR parser; thresholds/damage_score; dashboard order-by; triage rules and API; alerts API contract. Some tests need `DATABASE_URL`; triage-api skips write tests if migration 014 not applied. |
+| **npm run test** | Runs Node `--test` on db, lsrParser, thresholds, dashboard, sort, triage, api, triage-api, bulk-api, bulk-ui test files | PostGIS params; LSR parser; thresholds/damage_score; dashboard order-by; triage rules and API; alerts API contract; bulk triage/queue/ZIP export and UI summary format. Some tests need `DATABASE_URL`; triage-api skips write tests if migration 014 not applied. |
 | **npm run test:triage** | Runs Node `--test` on `triage.test.js` | Pure unit tests for `computeTriage()` and `actionToStatus()`: warning+interesting→actionable, monitoring reasons, confidence levels. No DB or network. |
 | **npm run test:triage-api** | Runs Node `--test` on `triage-api.test.js` | Triage filters (`triage_status`, `work_queue`), `buildAlertsOrderBy` work_queue, `updateAlertTriage`/audit, reset_to_system. Requires `DATABASE_URL`; write tests skip if triage columns missing (migration 014). |
 | **npm run test:lsr-hold** | Runs Node `--test` on `lsr-hold.test.js` | LSR hold start: only warning+geom+no LSR get awaiting; watch/geom missing never get hold. Skips if migration 015 not applied. |
 | **npm run test:lsr-recheck** | Runs Node `--test` on `lsr-recheck.test.js` | Recheck scheduling (due-by-interval), runSetBasedLsrMatchForAlerts, markLsrMatchedAndExpired. Requires `DATABASE_URL`. |
 | **npm run test:lsr-ui** | Runs Node `--test` on `lsr-ui.test.js` | LSR recheck API contract (alert has lsr_status, lsr_hold_until); UI helpers (countdown, Awaiting LSR display). |
+| **npm run test:bulk** | Runs Node `--test` on `bulk-api.test.js` and `bulk-ui.test.js` | Bulk triage (status + audit), reset_to_system, bulk queue idempotent, bulk ZIP export shape, BULK_MAX; bulk summary format and export URL. |
+| **npm run test:bulk-api** | Runs Node `--test` on `bulk-api.test.js` | Bulk getAlertsByIds, triage + audit, enqueueDeliveryOnce idempotent, zip export shape, config.bulkMax. |
+| **npm run test:bulk-ui** | Runs Node `--test` on `bulk-ui.test.js` | Bulk Copy Summary format (AI-STORMS BULK SUMMARY, per-alert blocks); export URL params; confirmation rules. |
+| **npm run test:clients** | Runs Node `--test` on `clients-api.test.js` and `clients-ui.test.js` | Clients CRUD, config GET/PUT, client-scoped alerts (territory + thresholds); UI URL/header/config. |
+| **npm run test:clients-api** | Runs Node `--test` on `clients-api.test.js` | Clients CRUD, config, getAlertsForClient territory filter and badges_for_client. |
+| **npm run test:clients-ui** | Runs Node `--test` on `clients-ui.test.js` | Client URL param, header content, config persist, territory banner. |
 | **npm run nws:test-zips** | Sends fixed GeoJSON polygons (Houston, Dallas) to PostGIS, prints returned ZIPs | ZCTA intersection: `getZipsByGeometry` and `zcta5_raw` work; SRID handling. Requires `DATABASE_URL` and `zcta5_raw` populated. |
 | **npm run nws:test-lsr** | Fetches recent LSR products from NWS, parses hail/wind/points, prints counts and samples; if DB has an alert with geometry, runs point-in-polygon and reports inserts | LSR API fetch; LSR parser (hail, wind, lat/lon); optional DB match + insert into `nws_alert_lsr`. Requires network; DB optional for full match step. |
 | **npm run nws:once** | Full ingest: fetch alerts → filter → upsert `nws_alerts` → derive ZIPs → upsert `alert_impacted_zips` → LSR enrichment → log summary JSON | End-to-end: NWS alerts, chunked states, activation filter, ZIP derivation, LSR fetch/parse/match. Check final JSON for `lsr_products_fetched`, `lsr_entries_parsed`, `lsr_matches_inserted`, etc. |
@@ -152,7 +162,7 @@ These are the test commands baked into the codebase. Use them to validate each p
 
 **Script locations**
 
-- Unit tests: `services/nws-ingestor/db.test.js`, `services/nws-ingestor/lsrParser.test.js`, `services/nws-ingestor/thresholds.test.js`, `services/nws-ingestor/dashboard.test.js`, `services/nws-ingestor/sort.test.js`, `services/nws-ingestor/triage.test.js`, `services/nws-ingestor/api.test.js`, `services/nws-ingestor/triage-api.test.js`, `services/nws-ingestor/lsr-hold.test.js`, `services/nws-ingestor/lsr-recheck.test.js`, `services/nws-ingestor/lsr-ui.test.js`
+- Unit tests: `services/nws-ingestor/db.test.js`, … `services/nws-ingestor/bulk-ui.test.js`, `services/nws-ingestor/clients-api.test.js`, `services/nws-ingestor/clients-ui.test.js`
 - ZIP test script: `services/nws-ingestor/scripts/test-zip-lookup.js`
 - LSR test script: `services/nws-ingestor/scripts/test-lsr-enrichment.js`
 
